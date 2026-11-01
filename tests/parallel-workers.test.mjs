@@ -108,7 +108,8 @@ test('scope admission respects ancestor intersections and symbolic aliases',t=>{
  assert.equal(first.mode,'exclusive','file verification outside the parent scope must not parallelize')
  f.items[0].verification=[{kind:'file',path:'src/a.txt'}]
  const narrowed=workerAdmission(f.plan,f.items[0]),second=workerAdmission(f.plan,f.items[2])
- assert.deepEqual(narrowed.paths,[path.join(f.workspace,'src/a.txt')]);assert.equal(canRunTogether(narrowed,second),false)
+ const expected=path.join(f.workspace,'src/a.txt')
+ assert.deepEqual(narrowed.paths,[process.platform==='win32'?expected.toLowerCase():expected]);assert.equal(canRunTogether(narrowed,second),false)
  fs.symlinkSync(path.join(f.workspace,'src'),path.join(f.workspace,'alias'),'dir')
  f.items[2].fileScope=['alias/a.txt'];f.items[2].verification=[{kind:'file',path:'alias/a.txt'}]
  assert.equal(canRunTogether(narrowed,workerAdmission(f.plan,f.items[2])),false)

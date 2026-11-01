@@ -31,6 +31,7 @@ type Worker = {
   pending: Map<string, PendingRequest>
   createdAt: number
   lastUsed: number
+  stopping?: Promise<void>
 }
 
 export class PythonRuntimeManager {
@@ -103,8 +104,8 @@ export class PythonRuntimeManager {
     let worker = this.workers.get(request.skillId)
 
     if (!worker || worker.status === 'error' || worker.status === 'stopped') {
-      worker = await this.createWorker(request)
-      this.workers.set(request.skillId, worker)
+      if(worker)await this.stopWorkerProcess(worker)
+      worker = await this.createWorker(request,signal)
     }
     if(signal.aborted||this.disposed){await this.stopWorker(request.skillId);signal.throwIfAborted();throw new Error('Runtime disposed')}
 
@@ -177,7 +178,7 @@ export class PythonRuntimeManager {
   /**
    * 创建 Worker 进程
    */
-  private async createWorker(request: ExecutionRequest): Promise<Worker> {
+  private async createWorker(request: ExecutionRequest,signal:AbortSignal): Promise<Worker> {
     // 检查并发限制
     if (this.workers.size >= this.config.maxWorkers) {
       // 停止最久未使用的 Worker
@@ -210,6 +211,9 @@ export class PythonRuntimeManager {
       )
     }
 
+    signal.throwIfAborted()
+    if(this.disposed)throw new Error('Runtime disposed')
+
     // 启动进程
     const entryPath = path.join(request.skillPath, 'index.py')
 
@@ -235,11 +239,13 @@ export class PythonRuntimeManager {
       skillId: request.skillId,
       process: child,
       venvPath,
-      status: 'idle',
+      status: 'busy',
       pending: new Map(),
       createdAt: Date.now(),
       lastUsed: Date.now()
     }
+    // Starting workers already own a process and must be visible to shutdown.
+    this.workers.set(request.skillId,worker)
 
     // 处理 stdout（JSON-RPC 响应）
     let buffer = ''
@@ -311,21 +317,35 @@ export class PythonRuntimeManager {
       worker.status = 'error'
     })
 
-    // 等待进程启动
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error('Worker startup timeout'))
-      }, 5000)
-
-      // 假设第一行输出表示准备就绪
-      const onData = () => {
-        clearTimeout(timer)
-        child.stdout.off('data', onData)
-        resolve()
-      }
-
-      child.stdout.once('data', onData)
-    })
+    // Settle readiness on every terminal path and remove temporary listeners.
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const finish=(error?:Error)=>{
+          clearTimeout(timer)
+          child.stdout.off('data',onData)
+          child.off('error',onError)
+          child.off('close',onClose)
+          signal.removeEventListener('abort',onAbort)
+          if(error)reject(error);else resolve()
+        }
+        const onData=()=>finish()
+        const onError=(error:Error)=>finish(error)
+        const onClose=(code:number|null)=>finish(new Error(`Worker exited: code=${code}`))
+        const onAbort=()=>finish(signal.reason??new Error('Task cancelled'))
+        const timer=setTimeout(()=>finish(new Error('Worker startup timeout')),5000)
+        child.stdout.once('data',onData)
+        child.once('error',onError)
+        child.once('close',onClose)
+        signal.addEventListener('abort',onAbort,{once:true})
+        if(signal.aborted)onAbort()
+      })
+      signal.throwIfAborted()
+      if(this.disposed||worker.status==='stopped')throw new Error('Runtime disposed')
+      worker.status='idle'
+    } catch(error) {
+      await this.stopWorkerProcess(worker)
+      throw error
+    }
 
     return worker
   }
@@ -389,10 +409,15 @@ export class PythonRuntimeManager {
   async stopWorker(skillId: string): Promise<void> {
     const worker = this.workers.get(skillId)
     if (!worker) return
+    await this.stopWorkerProcess(worker)
+  }
 
-    console.log(`[Runtime] Stopping worker: ${skillId}`)
+  private stopWorkerProcess(worker:Worker):Promise<void> {
+    if(worker.stopping)return worker.stopping
 
-    this.workers.delete(skillId)
+    console.log(`[Runtime] Stopping worker: ${worker.skillId}`)
+
+    if(this.workers.get(worker.skillId)===worker)this.workers.delete(worker.skillId)
     worker.status = 'stopped'
 
     // 拒绝所有待处理请求
@@ -402,11 +427,8 @@ export class PythonRuntimeManager {
     }
     worker.pending.clear()
 
-    // 终止进程
-    worker.process.kill('SIGTERM')
-
-    // 等待最多 3 秒
-    await new Promise<void>(resolve => {
+    worker.stopping=new Promise<void>(resolve => {
+      if(worker.process.pid===undefined||worker.process.exitCode!==null||worker.process.signalCode!==null){resolve();return}
       const timer = setTimeout(() => {
         worker.process.kill('SIGKILL')
         resolve()
@@ -416,7 +438,9 @@ export class PythonRuntimeManager {
         clearTimeout(timer)
         resolve()
       })
+      worker.process.kill('SIGTERM')
     })
+    return worker.stopping
   }
 
   /**

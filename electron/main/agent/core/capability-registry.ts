@@ -16,6 +16,8 @@ import { validateToolArguments } from './execution-guards.js'
 import {ExecutionRuntime} from './execution-runtime.js'
 import {searchRegion} from '../search-engines.js'
 import type {SearchHealth} from '../search-health.js'
+import {capabilityFingerprint} from './tool-surface.js'
+import type {CapabilityAdmission} from '../../../shared/types/capability.js'
 
 export class CapabilityRegistry {
   private executionRuntime=new ExecutionRuntime()
@@ -27,6 +29,15 @@ export class CapabilityRegistry {
   private searchHealth?:SearchHealth
   setSearchHealth(health:SearchHealth){this.searchHealth=health}
   private capabilities = new Map<string, Capability>()
+  private revisions=new Map<string,number>()
+  private nextRevision=0
+  admit(capability:Capability):CapabilityAdmission|undefined{
+    const current=this.capabilities.get(capability.name)
+    if(!current||!this.available(capability.name)||capabilityFingerprint(current)!==capabilityFingerprint(capability))return
+    return {revision:this.revisions.get(capability.name)!,fingerprint:capabilityFingerprint(current)}
+  }
+  private available(name:string):boolean{try{return this.builtinHandlers.get(name)?.available()!==false}catch{return false}}
+  private admissionChanged():CapabilityExecutionResult{return {success:false,outcome:'failed',failureCode:'conflict',admissionRejected:true,error:'工具定义或提供者已变化，本次未调用新提供者；请使用本轮最新工具列表重新生成调用。',elapsedMs:0}}
   private builtinHandlers = new Map<string, {run:(args:Record<string,unknown>,signal:AbortSignal,workspace?:string,request?:CapabilityExecutionRequest)=>Promise<unknown>;available:()=>boolean}>()
   registerBuiltin(capability:Capability,run:(args:Record<string,unknown>,signal:AbortSignal,workspace?:string,request?:CapabilityExecutionRequest)=>Promise<unknown>,available:()=>boolean=()=>true){
     this.register(capability);this.builtinHandlers.set(capability.name,{run,available})
@@ -68,10 +79,14 @@ export class CapabilityRegistry {
   }
 
   refreshMCP(): void {
+    const incoming=new Map((this.mcpAdapter?.getAllCapabilities()||[]).map(capability=>[capability.name,capability]))
     for (const [name, capability] of this.capabilities) {
-      if (capability.source.type === 'mcp') this.capabilities.delete(name)
+      if (capability.source.type === 'mcp'&&!incoming.has(name))this.unregister(name)
     }
-    for (const capability of this.mcpAdapter?.getAllCapabilities() || []) this.register(capability)
+    for (const capability of incoming.values()){
+      const current=this.capabilities.get(capability.name)
+      if(!current||capabilityFingerprint(current)!==capabilityFingerprint(capability))this.register(capability)
+    }
   }
 
   /**
@@ -135,6 +150,8 @@ export class CapabilityRegistry {
     }
 
     this.capabilities.set(capability.name, capability)
+    this.builtinHandlers.delete(capability.name)
+    this.revisions.set(capability.name,++this.nextRevision)
     console.log(`[CapabilityRegistry] Registered: ${capability.name}`)
   }
 
@@ -143,6 +160,8 @@ export class CapabilityRegistry {
    */
   unregister(name: string): void {
     if (this.capabilities.delete(name)) {
+      this.builtinHandlers.delete(name)
+      this.revisions.delete(name)
       console.log(`[CapabilityRegistry] Unregistered: ${name}`)
     }
   }
@@ -158,7 +177,7 @@ export class CapabilityRegistry {
    * 列出能力
    */
   list(options?: CapabilityQueryOptions): Capability[] {
-    let capabilities = Array.from(this.capabilities.values()).filter(capability=>this.builtinHandlers.get(capability.name)?.available()!==false)
+    let capabilities = Array.from(this.capabilities.values()).filter(capability=>this.available(capability.name))
 
     // 按分类过滤
     if (options?.category) {
@@ -216,6 +235,7 @@ export class CapabilityRegistry {
     const capability = this.capabilities.get(request.capability)
 
     if (!capability) {
+      if(request.admission)return this.admissionChanged()
       return {
         success: false,
         error: `Capability not found: ${request.capability}`,
@@ -223,10 +243,20 @@ export class CapabilityRegistry {
       }
     }
 
-    return this.executionRuntime.execute(capability,request,signal,()=>this.executeDirect(capability,request,signal))
+    const admission=request.admission??this.admit(capability)
+    const matches=()=>{
+      const current=this.capabilities.get(capability.name)
+      return !!admission&&!!current&&this.available(capability.name)&&this.revisions.get(capability.name)===admission.revision&&capabilityFingerprint(current)===admission.fingerprint
+    }
+    const changed=()=>this.admissionChanged()
+    if(!matches())return changed()
+    // Own the arguments and execution envelope before resource queues or user callbacks yield.
+    const executionRequest={...request,args:structuredClone(request.args),context:request.context?{...request.context}:undefined,execution:request.execution?{...request.execution}:undefined,admission:{...admission!}}
+    const definition=structuredClone(capability)
+    return this.executionRuntime.execute(definition,executionRequest,signal,()=>matches()?this.executeDirect(definition,executionRequest,signal,matches):Promise.resolve(changed()))
   }
 
-  private async executeDirect(capability:Capability,request:CapabilityExecutionRequest,signal:AbortSignal):Promise<CapabilityExecutionResult> {
+  private async executeDirect(capability:Capability,request:CapabilityExecutionRequest,signal:AbortSignal,admitted:()=>boolean):Promise<CapabilityExecutionResult> {
     const startTime = Date.now()
 
     try {
@@ -264,6 +294,7 @@ export class CapabilityRegistry {
         const handler=this.builtinHandlers.get(capability.name)
         if(!handler||!handler.available())throw new Error('插件未启用或能力不可用')
         signal.throwIfAborted()
+        if(!admitted())return this.admissionChanged()
         output=await handler.run(request.args,signal,request.workspace,request)
         signal.throwIfAborted()
 
@@ -310,7 +341,7 @@ export class CapabilityRegistry {
     }
 
     for (const name of toRemove) {
-      this.capabilities.delete(name)
+      this.unregister(name)
     }
 
     // 重新加载

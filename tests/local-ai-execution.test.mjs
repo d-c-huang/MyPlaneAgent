@@ -83,6 +83,26 @@ test('supervisor retains long output and split UTF-8; cancellation and timeout a
  assert.equal((await pending).termination,'cancelled')
 })
 
+for(const first of ['cancelled','timeout']){
+ test(`supervisor preserves ${first} when another stop reason arrives during process cleanup`,{timeout:15000},async t=>{
+  const root=sandbox(t),controller=new AbortController(),nativeTimeout=globalThis.setTimeout
+  let deadline,ready
+  const started=new Promise(resolve=>{ready=resolve})
+  t.mock.method(globalThis,'setTimeout',(callback,delay,...args)=>{
+   if(delay===60000)deadline=()=>callback(...args)
+   return nativeTimeout(callback,delay,...args)
+  })
+  t.after(()=>controller.abort())
+  const pending=executeProcess({executable:process.execPath,args:['-e',"console.log('READY');setInterval(()=>{},1000)"],cwd:root,timeoutMs:60000},controller.signal,output=>{if(output.includes('READY'))ready()})
+  await Promise.race([started,pending.then(()=>assert.fail('fixture exited before it was ready'))])
+  assert.equal(typeof deadline,'function')
+  if(first==='cancelled'){controller.abort();deadline()}else{deadline();controller.abort()}
+  const result=await pending
+  assert.equal(result.termination,first)
+  assert.match(result.error,first==='cancelled'?/已停止/:/超过运行时间/)
+ })
+}
+
 test('sandbox wrapper disables network, drops privileges and host fallback uses a temporary home',async t=>{
  const root=sandbox(t),wrapped=buildSandboxedRequest({executable:'node',args:['-e',"console.log('ok')"],cwd:root},{available:true,runtime:'docker',image:'fixture:latest',reason:'fixture'})
  assert.equal(wrapped.executable,'docker');assert.ok(wrapped.args.includes('none'));assert.ok(wrapped.args.includes('ALL'));assert.ok(wrapped.args.includes('no-new-privileges'));assert.ok(wrapped.args.includes('fixture:latest'));assert.ok(wrapped.args.some(value=>value===`${path.resolve(root)}:/workspace:rw`))

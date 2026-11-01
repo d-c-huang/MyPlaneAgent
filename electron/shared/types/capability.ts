@@ -44,7 +44,10 @@ export type Capability = {
 /**
  * 能力执行请求
  */
+export type CapabilityAdmission={revision:number;fingerprint:string}
 export type CapabilityExecutionRequest = {
+  /** Host-owned step admission. A model tool argument cannot supply or override it. */
+  admission?:CapabilityAdmission
   execution?: {
     taskId:string; itemId?:string; workerId?:string; activityId?:string; parentEvidenceId?:string
     workspace?:string; kind?:import('../task-contract.js').TaskKind; mode?:'read'|'write'|'verify'; writeScopes?:string[][]
@@ -67,6 +70,8 @@ export type CapabilityExecutionRequest = {
  * 能力执行结果
  */
 export type CapabilityExecutionResult = {
+  /** Registry fact: the admitted provider was withdrawn before any invocation. */
+  admissionRejected?:true
   outcome?:import('../task-contract.js').ExecutionOutcome
   failureCode?:import('../task-contract.js').FailureCode
   success: boolean

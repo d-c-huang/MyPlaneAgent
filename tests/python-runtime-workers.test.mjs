@@ -5,9 +5,9 @@ import os from 'node:os'
 import path from 'node:path'
 import {PythonRuntimeManager} from '../dist-electron/main/agent/core/python-runtime-manager.js'
 
-function fixture(t){
+function fixture(t,source,config){
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'myplane-worker-'))
- fs.writeFileSync(path.join(root,'index.py'),`import json, os, pathlib, sys, time
+ fs.writeFileSync(path.join(root,'index.py'),source??`import json, os, pathlib, sys, time
 print('READY', flush=True)
 for line in sys.stdin:
     request=json.loads(line)
@@ -16,7 +16,7 @@ for line in sys.stdin:
     while args.get('gate') and not pathlib.Path(args['gate']).exists(): time.sleep(0.005)
     print(json.dumps({'type':'response','id':request['id'],'output':{'pid':os.getpid(),'value':args.get('value')},'elapsedMs':1}), flush=True)
 `)
- const manager=new PythonRuntimeManager(root)
+ const manager=new PythonRuntimeManager(root,config)
  t.after(async()=>{await manager.dispose();fs.rmSync(root,{recursive:true,force:true})})
  const run=(args,signal=new AbortController().signal)=>manager.execute({skillId:'fixture',skillPath:root,tool:'read',args,workspace:root,venv:false,timeout:5000},signal)
  return {root,manager,run}
@@ -77,4 +77,55 @@ test('disposing the runtime prevents queued callers from restarting a worker',as
  await Promise.all([active,queued])
  assert.equal(manager.listWorkers().length,0)
  await assert.rejects(run({}),/disposed/)
+})
+
+const alive=pid=>{try{process.kill(pid,0);return true}catch{return false}}
+function stalledWorker(t){
+ let pid
+ // Ensure a regression cannot leave the deliberately unresponsive fixture alive.
+ t.after(()=>{if(pid&&alive(pid))process.kill(pid)})
+ const f=fixture(t,`import os, pathlib, time
+pathlib.Path('pid').write_text(str(os.getpid()))
+time.sleep(60)
+`)
+ return {...f,pid:async()=>{await started(path.join(f.root,'pid'));pid=Number(fs.readFileSync(path.join(f.root,'pid'),'utf8'));return pid}}
+}
+
+test('startup timeout terminates an unresponsive worker before rejecting',{timeout:15000},async t=>{
+ const f=stalledWorker(t),rejected=assert.rejects(f.run({}),/Worker startup timeout/)
+ const pid=await f.pid()
+ await rejected
+ assert.equal(alive(pid),false,'timed-out Python process must have exited')
+ assert.deepEqual(f.manager.listWorkers(),[])
+})
+
+test('cancellation during startup terminates the process and preserves the reason',{timeout:15000},async t=>{
+ const f=stalledWorker(t),controller=new AbortController(),reason=new Error('cancel startup')
+ const rejected=assert.rejects(f.run({},controller.signal),error=>error===reason)
+ const pid=await f.pid()
+ controller.abort(reason)
+ await rejected
+ assert.equal(alive(pid),false)
+ assert.deepEqual(f.manager.listWorkers(),[])
+})
+
+test('disposing during startup terminates the worker without waiting for readiness',{timeout:15000},async t=>{
+ const f=stalledWorker(t),rejected=assert.rejects(f.run({}),/stopped|exited|disposed/i)
+ const pid=await f.pid()
+ await f.manager.dispose()
+ await rejected
+ assert.equal(alive(pid),false)
+ assert.deepEqual(f.manager.listWorkers(),[])
+})
+
+test('startup reports the actual early exit instead of a readiness timeout',async t=>{
+ const {manager,run}=fixture(t,'import sys\nsys.exit(23)\n')
+ await assert.rejects(run({}),/Worker exited: code=23/)
+ assert.deepEqual(manager.listWorkers(),[])
+})
+
+test('startup reports an executable error and removes the failed worker',async t=>{
+ const {manager,run}=fixture(t,'',{pythonExecutable:path.join(os.tmpdir(),'myplane-python-does-not-exist')})
+ await assert.rejects(run({}),/ENOENT/)
+ assert.deepEqual(manager.listWorkers(),[])
 })

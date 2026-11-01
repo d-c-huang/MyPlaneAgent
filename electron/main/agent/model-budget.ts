@@ -1,4 +1,4 @@
-import { estimateTokens } from '../local-ai-context.js'
+import { estimateTokens,contextSafetyTokens } from '../local-ai-context.js'
 import type { AgentConnection, AgentMessage } from './model.js'
 import type { ToolDefinition } from './registry.js'
 
@@ -29,7 +29,7 @@ export function readModelCapacityError(body: string): ModelContextCapacityError 
 export function requestBudget(connection: AgentConnection, model: string, messages: AgentMessage[], tools: false | ToolDefinition[] | undefined, actualInput = 0): AgentConnection {
  const capacity = modelCapacity(connection, model)
  const input = Math.max(actualInput, estimateTokens(messages) + estimateTokens(tools || undefined) + 32)
- const headroom = Math.max(256, Math.ceil(capacity * .02))
+ const headroom = contextSafetyTokens(capacity)
  const available = capacity - input - headroom
  if (available < 1) throw new ModelContextCapacityError(capacity, input)
  return { ...connection, contextLength: capacity, maxTokens: Math.max(1, Math.floor(Math.min(connection.maxTokens, capacity / 2, available))) }

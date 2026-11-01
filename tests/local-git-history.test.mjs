@@ -1,14 +1,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import {execFileSync} from 'node:child_process'
 import {withLocalGitHistory} from '../dist-electron/main/agent/local-git-history.js'
+import {isolatedGitWorkspace} from './helpers/workspace.mjs'
 
 const git=(root,...args)=>execFileSync('git',args,{cwd:root,encoding:'utf8',windowsHide:true}).trim()
 const workspace=t=>{
- const root=fs.mkdtempSync(path.join(os.tmpdir(),'myplane-local-git-'))
+ const root=isolatedGitWorkspace('myplane-local-git-')
  t.after(()=>fs.rmSync(root,{recursive:true,force:true}))
  return root
 }

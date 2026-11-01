@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import {estimateTokens,contextStatus,assertContextFits,type ContextMessage,type ContextBudget} from '../local-ai-context.js'
+import {estimateTokens,contextStatus,assertContextFits,createContextCheckpoint,type ContextMessage,type ContextBudget} from '../local-ai-context.js'
 import type {ContextCheckpoint} from '../../shared/local-ai-context.js'
 import type {ToolDefinition} from './registry.js'
 
@@ -54,7 +54,7 @@ export function recoveryCheckpoint(history:ContextMessage[],system:ContextMessag
  const users=history.filter(message=>message.role==='user')
  if(users.some(message=>Array.isArray(message.content)&&message.content.some(part=>part?.type==='image_url')))throw new Error('历史含图片，无法在摘要失败时无损恢复；请重试摘要')
  const summary=JSON.stringify({recovery:'模型摘要失败；以下为原始用户要求与执行记录。历史细节用 read_history 核对，不重放已执行或结果未知的操作。',previousSummary:previous?.source==='recovery'?'':previous?.summary||'',userRequests:users.map(message=>message.content),executions:ledger})
- const checkpoint:ContextCheckpoint={summary,through,source:'recovery',updatedAt:new Date().toISOString(),compactions:(previous?.compactions||0)+1}
+ const checkpoint=createContextCheckpoint(history,through,summary,previous,budget.pinned,'recovery')
  const after=contextStatus(history,system,checkpoint,budget)
  assertContextFits(after)
  if(after.inputTokens>=contextStatus(history,system,previous,budget).inputTokens)throw new Error('结构化恢复未能缩短上下文')

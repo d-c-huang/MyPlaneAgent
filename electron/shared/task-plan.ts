@@ -33,4 +33,4 @@ export type TaskItem = {
   baseline?:TaskVerificationRun;baselineHistory?:TaskVerificationRun[];baselineUnavailableReason?:string;mutationStarted?:boolean;
   excludedProjectChecks?:Array<{createdAt:string;reason:string;rules:TaskVerificationRule[];baseline?:TaskVerificationRun;runs?:TaskVerificationRun[]}>;
 }
-export type TaskPlan = {scope?:import('./task-scope.js').TaskScope;needsReplan?:boolean;graphVersion?:1;maxParallelWorkers?:number;editProgress?:import('../main/agent/core/edit-progress.js').EditProgressState;taskId:string;workspace:string;items:TaskItem[];updatedAt:string}
+export type TaskPlan = {workerTimeoutMs?:number;scope?:import('./task-scope.js').TaskScope;needsReplan?:boolean;graphVersion?:1;maxParallelWorkers?:number;editProgress?:import('../main/agent/core/edit-progress.js').EditProgressState;taskId:string;workspace:string;items:TaskItem[];updatedAt:string}

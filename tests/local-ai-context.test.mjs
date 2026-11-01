@@ -4,7 +4,9 @@ import {compactContext,contextMessages,contextStatus,estimateTokens,needsCompact
 import {ModelOutputLimitError} from '../dist-electron/main/local-ai-model-error.js'
 const budget={contextLength:8192,maxTokens:1024}
 const system=[{role:'system',content:'遵守用户要求；修改前确认。'}]
-const history=()=>[{role:'user',content:'修复 web 中的登录问题，保留用户数据。'},...Array.from({length:12},(_,i)=>({role:i%2?'assistant':'user',content:`记录 ${i} `+'项目进展和验证结果。'.repeat(100)})),{role:'user',content:'请继续验证，不要部署。'}]
+// User requirements remain verbatim; verbose assistant progress is the compressible history.
+const history=()=>[{role:'user',content:'修复 web 中的登录问题，保留用户数据。'},...Array.from({length:12},(_,i)=>({role:i%2?'assistant':'user',content:i%2?`记录 ${i} `+'项目进展和验证结果。'.repeat(200):`继续检查第 ${i} 项。`})),{role:'user',content:'请继续验证，不要部署。'}]
+const imageHistory=()=>[{role:'user',content:[{type:'text',text:'修复登录，保留数据。'},{type:'image_url',image_url:{url:'data:image/png;base64,source'}}]},...history().slice(1)]
 const summarize=async()=>'目标：修复 web 登录，保留用户数据。已检查代码；尚未部署。下一步验证。'
 const signal=()=>new AbortController().signal
 
@@ -27,7 +29,7 @@ test('large contexts allow provider output budgets while preserving half for inp
 
 test('genuinely oversized input still fails with actionable token counts',()=>{
  const status=contextStatus([{role:'user',content:'字'.repeat(3000)}],system,undefined,inferenceBudget({contextLength:2048,maxTokens:2048}))
- assert.throws(()=>assertContextFits(status),/预留输出 1024 > 容量 2048 tokens/)
+ assert.throws(()=>assertContextFits(status),/预留输出 1024 \+ 安全余量 \d+ > 容量 2048 tokens/)
 })
 
 test('compaction preserves full history, newest request and system constraints; summaries survive subsequent rounds',async()=>{
@@ -93,7 +95,7 @@ test('large local contexts can finish reasoning summaries beyond the fixed 2048-
   limits.push(limit)
   assert.ok(estimateTokens(rows)+limit<settings.contextLength)
   assert.ok(limit<=settings.maxTokens)
-  assert.match(rows[0].content,/摘要最多 170 字/)
+  assert.match(rows[0].content,/摘要最多 436 字/)
   if(limit<=2048)throw new ModelOutputLimitError(limit)
   return '<think>模型仍然进行了内部分析</think>检查项目，不要部署。已检查代码，待验证。'
  }})
@@ -120,23 +122,23 @@ test('summary input excludes thinking traces but keeps complete tool evidence an
 })
 
 test('summary exhaustion reports its own budget and recovery failure without task-output advice',async()=>{
- await assert.rejects(compactContext({history:history(),system,budget,signal:signal(),summarize:async(_rows,limit)=>{throw new ModelOutputLimitError(limit)}}),error=>{
+ await assert.rejects(compactContext({history:imageHistory(),system,budget,signal:signal(),summarize:async(_rows,limit)=>{throw new ModelOutputLimitError(limit)}}),error=>{
   assert.ok(error instanceof ModelOutputLimitError)
   assert.match(error.message,/历史摘要达到本次 1024 Token/)
-  assert.match(error.message,/无法安全恢复/)
+  assert.match(error.message,/包含图片/)
   assert.doesNotMatch(error.message,/本轮工具未执行|Error:|工作区默认值/)
   return true
  })
 })
 
 test('repeated summary truncation pauses after one retry without replacing checkpoint',async()=>{
- const messages=history(),previous={summary:'旧摘要',through:1,compactions:1,updatedAt:'before'},saved=structuredClone(previous);let calls=0
+ const messages=imageHistory(),previous={summary:'旧摘要',through:1,compactions:1,updatedAt:'before'},saved=structuredClone(previous);let calls=0
  await assert.rejects(compactContext({history:messages,system,checkpoint:previous,budget,force:true,signal:signal(),summarize:async(_rows,limit)=>{calls++;throw new ModelOutputLimitError(limit)}}),/截断/)
  assert.equal(calls,2);assert.deepEqual(previous,saved)
 })
 
 test('2048-token context can retry a compact summary above the old 614-token ceiling',async()=>{
- const messages=[{role:'user',content:'检查文件，保留数据。'.repeat(120)},{role:'assistant',content:'尚未执行。'},{role:'user',content:'继续'}]
+ const messages=[{role:'user',content:'检查文件，保留数据。'},{role:'assistant',content:'历史检查记录。'.repeat(300)},{role:'user',content:'继续'}]
  let calls=0
  const settings=inferenceBudget({contextLength:2048,maxTokens:2048})
  const checkpoint=await compactContext({history:messages,system:[],budget:settings,force:true,signal:signal(),summarize:async(rows,limit)=>{
@@ -188,7 +190,7 @@ test('optional summary failure keeps original context usable without installing 
 })
 
 test('mandatory compaction rejects repeated empty summaries without changing old checkpoint',async()=>{
- const messages=history(),previous={summary:'保留数据，不部署',through:1,updatedAt:'before',compactions:1},original=structuredClone(previous)
+ const messages=imageHistory(),previous={summary:'保留数据，不部署',through:1,updatedAt:'before',compactions:1},original=structuredClone(previous)
  let calls=0
  await assert.rejects(compactContext({history:messages,system,checkpoint:previous,budget,force:true,signal:signal(),summarize:async()=>{calls++;return ''}}),/已自动重试一次/)
  assert.equal(calls,2);assert.deepEqual(previous,original)

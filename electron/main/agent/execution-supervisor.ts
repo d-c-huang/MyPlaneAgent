@@ -30,8 +30,8 @@ export async function executeProcess(request:ProcessRequest,signal:AbortSignal,o
    await stopProcessTree(child.pid)
    try{child.kill('SIGKILL')}catch{/* Already exited. */}
   })()
-  const abort=()=>{termination='cancelled';void stop()}
-  const timer=setTimeout(()=>{termination='timeout';void stop()},request.timeoutMs)
+  const abort=()=>{termination??='cancelled';void stop()}
+  const timer=setTimeout(()=>{termination??='timeout';void stop()},request.timeoutMs)
   signal.addEventListener('abort',abort,{once:true});if(signal.aborted)abort()
   const decoders=[new StringDecoder('utf8'),new StringDecoder('utf8')]
   const append=(chunk:Buffer,index:number)=>{

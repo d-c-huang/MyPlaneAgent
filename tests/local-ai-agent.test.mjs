@@ -12,6 +12,7 @@ import {AgentWorkspace} from '../dist-electron/main/agent/workspace.js'
 import {extractDocument,makeDocument,makeSpreadsheet} from '../dist-electron/main/agent/documents.js'
 import {LocalAgentService} from '../dist-electron/main/agent/service.js'
 import {requestAgentModel,agentModelTiming,llamaToolDefinitions,ModelResponseSizeError} from '../dist-electron/main/agent/model.js'
+import {isolatedGitWorkspace} from './helpers/workspace.mjs'
 const signal=()=>new AbortController().signal
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms))
 async function until(check,label='condition'){const end=Date.now()+10000;while(!check()){if(Date.now()>end)throw new Error('Timed out: '+label);await pause(10)}}
@@ -33,8 +34,9 @@ test('deleting an agent conversation removes its task and audit records',t=>{
  assert.equal(service.list().length,0);assert.equal(fs.existsSync(path.join(directory,id+'.json')),false);assert.equal(fs.existsSync(path.join(directory,'audit',id+'.jsonl')),false)
  assert.throws(()=>service.delete(id),/不存在|损坏/)
 })
-async function harness(t,reply,connection){
- const root=sandbox(t),workspace=path.join(root,'project');fs.mkdirSync(workspace);let requests=0
+async function harness(t,reply,connection,isolatedGit=false){
+ const root=isolatedGit?isolatedGitWorkspace('myplane-agent-test-'):sandbox(t),workspace=path.join(root,'project');fs.mkdirSync(workspace);let requests=0
+ if(isolatedGit)t.after(()=>fs.rmSync(root,{recursive:true,force:true}))
  const server=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;try{const result=await reply(JSON.parse(raw),requests++);if(result?.sse){res.setHeader('Content-Type','text/event-stream');res.end(result.sse)}else{res.setHeader('Content-Type','application/json');res.end(JSON.stringify(result))}}catch(error){res.writeHead(500);res.end(String(error))}})
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>{server.closeAllConnections();server.close()})
  const service=new LocalAgentService(path.join(root,'tasks'),()=>({endpoint:`http://127.0.0.1:${server.address().port}/v1`,key:'',maxTokens:2048,contextLength:16384,...connection}));t.after(()=>service.dispose())
@@ -45,7 +47,7 @@ test('project tasks initialize local Git before model execution, including resum
  const h=await harness(t,()=>{
   assert.equal(fs.existsSync(path.join(h.workspace,'.git')),true)
   return response('已检查项目')
- })
+ },undefined,true)
  const task=h.start()
  await until(()=>h.service.get(task.id).status==='completed')
  const config=fs.readFileSync(path.join(h.workspace,'.git','config'),'utf8')
@@ -451,7 +453,7 @@ test('agent automatically summarizes long histories, preserves archive and resum
  const h=await harness(t,body=>{if(!body.tools){summaries++;return {...response('目标：修复项目。已经读取文件，尚未修改；下一步验证。'),usage:{prompt_tokens:100,completion_tokens:30,total_tokens:130}}}lastMain=body;return {...response('完成'),usage:{prompt_tokens:200,completion_tokens:20,total_tokens:220}}})
  const initial=h.start();await until(()=>!h.service.active(initial.id))
  const file=path.join(h.root,'tasks',initial.id+'.json'),task=JSON.parse(fs.readFileSync(file,'utf8'))
- task.messages=Array.from({length:20},(_,i)=>({role:i%2?'assistant':'user',content:'记录 '+i+'：'+ '历史文件分析结果。'.repeat(150)}))
+ task.messages=Array.from({length:20},(_,i)=>({role:i%2?'assistant':'user',content:i%2?'记录 '+i+'：'+ '历史文件分析结果。'.repeat(300):'继续检查第 '+i+' 项'}))
  const archive=structuredClone(task.messages),events=structuredClone(task.events)
  fs.writeFileSync(file,JSON.stringify(task))
  const next=h.start({taskId:initial.id,prompt:'继续验证，不要部署'});await until(()=>!h.service.active(next.id))
@@ -553,13 +555,13 @@ test('output-limit retry respects cancellation and token budget',async t=>{
 })
 
 
-test('output-limit recovery grows 2048 to 4096 then 8192 and never executes truncated calls',async t=>{
+test('output-limit recovery grows 2048 to 4096 then 8192 with sufficient context and never executes truncated calls',async t=>{
  const limits=[]
  const h=await harness(t,(body,n)=>{
   limits.push(body.max_tokens)
   if(n<2)return {choices:[{finish_reason:'length',message:{tool_calls:[call('write_file',{path:'truncated.txt',content:'do not execute'})]}}]}
   return response('恢复完成')
- })
+ },{contextLength:32768})
  const task=h.start();await until(()=>!h.service.active(task.id));const result=h.service.get(task.id)
  assert.deepEqual(limits,[2048,4096,8192]);assert.equal(result.status,'completed',result.error)
  assert.equal(result.events.filter(event=>event.kind==='tool').length,0);assert.equal(fs.existsSync(path.join(h.workspace,'truncated.txt')),false)
@@ -568,10 +570,26 @@ test('output-limit recovery grows 2048 to 4096 then 8192 and never executes trun
 
 test('output-limit recovery remains bounded when every response is truncated',async t=>{
  let requests=0
- const h=await harness(t,()=>{requests++;return {choices:[{finish_reason:'length',message:{content:'partial'}}]}})
+ const h=await harness(t,()=>{requests++;return {choices:[{finish_reason:'length',message:{content:'partial'}}]}},{contextLength:32768})
  const task=h.start();await until(()=>!h.service.active(task.id));const result=h.service.get(task.id)
  assert.equal(requests,3);assert.equal(result.status,'stopped');assert.match(result.error,/8192/)
  assert.equal(result.events.some(event=>event.kind==='tool'),false)
+})
+
+test('output-limit recovery reserves mandatory host state before increasing its output allowance',async t=>{
+ const bodies=[],capacity=16384
+ const h=await harness(t,(body,n)=>{
+  bodies.push(body)
+  assert.ok(body.messages.some(message=>String(message.content).includes('approvalMode')),'mandatory permissions must remain in the actual request')
+  assert.ok(estimateTokens(body.messages)+estimateTokens(body.tools)+body.max_tokens+32+Math.ceil(capacity*.05)<=capacity)
+  return n<2?{choices:[{finish_reason:'length',message:{content:'partial'}}]}:response('完成')
+ },{contextLength:capacity})
+ const task=h.start();await until(()=>!h.service.active(task.id))
+ const result=h.service.get(task.id)
+ assert.equal(result.status,'completed',result.error);assert.equal(bodies.length,3)
+ assert.deepEqual(bodies.slice(0,2).map(body=>body.max_tokens),[2048,4096])
+ assert.ok(bodies[2].max_tokens>4096&&bodies[2].max_tokens<8192)
+ assert.equal(result.context.reservedOutput,bodies[2].max_tokens)
 })
 
 
@@ -585,5 +603,6 @@ test('output recovery respects small context space and disables reasoning on ret
  const task=h.start({fastMode:false});await until(()=>!h.service.active(task.id));const result=h.service.get(task.id)
  assert.equal(result.status,'completed',result.error);assert.equal(bodies.length,2)
  assert.equal(bodies[0].chat_template_kwargs.enable_thinking,true);assert.equal(bodies[1].chat_template_kwargs.enable_thinking,false)
- assert.ok(bodies[1].max_tokens>=bodies[0].max_tokens);assert.ok(bodies[1].max_tokens<=2048)
+ assert.ok(bodies[1].max_tokens>0);assert.ok(bodies[1].max_tokens<=2048)
+ assert.ok(estimateTokens(bodies[1].messages)+estimateTokens(bodies[1].tools)+bodies[1].max_tokens+32+Math.ceil(4096*.05)<=4096,'recovery reserves the same safety margin as normal inference')
 })

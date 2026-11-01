@@ -76,6 +76,7 @@ export function parseTaskItems(text:string):TaskItem[]{
 export type PlanExecution = {goal?:string;taskId:string;plan?:TaskPlan;save:(plan:TaskPlan)=>void}
 /** Persist before execution and after evidence, and never automatically replay completed items. */
 export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution,run:(options:ChatRunOptions)=>Promise<void>,verify?:(rules:TaskVerificationRule[],item?:TaskItem,executionOptions?:ChatRunOptions)=>Promise<TaskVerificationResult[]>){
+  if(options.workerTimeoutMs!==undefined&&(!Number.isSafeInteger(options.workerTimeoutMs)||options.workerTimeoutMs<0||options.workerTimeoutMs>2147483647))throw new Error('子任务超时必须为非负整数毫秒，0 表示不设置整体截止')
   if(options.maxToolCalls!==undefined&&(!Number.isSafeInteger(options.maxToolCalls)||options.maxToolCalls<0))throw new Error('工具调用上限必须为非负整数')
   let plan=execution.plan
   const firstUser=options.messages.find(message=>message.role==='user')?.content
@@ -111,6 +112,8 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
     save()
   }
   if(!plan)throw new Error('任务清单未建立')
+  if(options.workerTimeoutMs!==undefined)plan.workerTimeoutMs=options.workerTimeoutMs
+  if(plan.workerTimeoutMs!==undefined&&(!Number.isSafeInteger(plan.workerTimeoutMs)||plan.workerTimeoutMs<0||plan.workerTimeoutMs>2147483647))throw new Error('已保存的子任务超时配置无效')
   if(!plan.scope){plan.scope=scope;save()}
   for(const item of plan.items){
     item.kindSource??=item.kind?'explicit':'migrated'
@@ -194,11 +197,13 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
       }else item.worker.toolLimitSource='configured'
       item.worker.toolCalls??=0
     }
-    const workerSignal=item.worker?AbortSignal.any([executionSignal,AbortSignal.timeout(item.mode==='read'?240000:600000)]):executionSignal
+    // Model/tool idle timers and no-progress guards remain active. A worker-wide
+    // deadline is opt-in, so productive reads do not stop after a fixed four minutes.
+    const workerSignal=!plan.workerTimeoutMs?executionSignal:AbortSignal.any([executionSignal,AbortSignal.timeout(plan.workerTimeoutMs)])
     const budget={used:item.worker?.toolCalls||0,limit:item.worker?.maxToolCalls??options.maxToolCalls}
     const budgetExhausted=()=>budget.limit!==undefined&&budget.used>=budget.limit
     const budgetMessage=()=>`子智能体工具调用已达到本项上限（${budget.used}/${budget.limit} 次）；调整设置的上限后可继续。`
-    const countedTools=new Set<string>()
+    const countedTools=new Set([...(item.evidenceIds||[]),...(item.evidence||[]).map(evidence=>evidence.activityId)])
     let reportedTokens=0
     const countActivity=(activity:import('../../../shared/local-ai-studio.js').StudioToolActivity)=>{
       if(activity.status==='denied')stopWorkers()
@@ -354,7 +359,8 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
         return {status:outcome==='needs_input'?'needs_input':'blocked',content:`任务停在「${item.title}」，已保存进度。\n\n${content}`}
       }
     }catch(error){
-      item.status='blocked';item.outcome='blocked';item.summary=error instanceof Error?error.message:String(error);item.runtime={status:executionSignal.aborted?'cancelled':'waiting',phase:item.runtime?.phase||'act',waitReason:options.signal.aborted?undefined:stopRequested?'approval':failureCode(item.summary)==='budget'?'budget':workerSignal.aborted?'budget':'environment',updatedAt:new Date().toISOString()};if(item.worker)item.worker.finishedAt=new Date().toISOString();save()
+      const timedOut=workerSignal.reason?.name==='TimeoutError'||failureCode(String(error))==='timeout'
+      item.status='blocked';item.outcome='blocked';item.summary=timedOut?'子任务等待超时，执行历史和恢复点已保留；可继续核对已有结果。\n'+String(error):error instanceof Error?error.message:String(error);item.runtime={status:executionSignal.aborted?'cancelled':'waiting',phase:item.runtime?.phase||'act',waitReason:options.signal.aborted?undefined:stopRequested?'approval':timedOut?'timeout':failureCode(item.summary)==='budget'?'budget':'environment',updatedAt:new Date().toISOString()};if(item.worker)item.worker.finishedAt=new Date().toISOString();save()
       if((item.worker||stopRequested)&&!options.signal.aborted)return {status:'blocked',content:`任务停在「${item.title}」，已保存进度。\n\n${item.summary}`}
       throw error
     }

@@ -16,3 +16,10 @@ test('structured checks are bounded, validated and never parsed from truncated J
  for(const actions of [[{...action,args:[]}],[{...action,required:'yes'}],Array(7).fill(action)])assert.equal(parseCompletionReview(JSON.stringify({...value,actions})),undefined)
  assert.equal(parseCompletionReview(JSON.stringify(value).slice(0,-2)),undefined)
 })
+
+test('nine historical evidence IDs are rejected; optional implementation remains bounded at eight',()=>{
+ const review={status:'complete',reason:'已核对原始记录',implementation:{status:'present',evidenceIds:Array.from({length:9},(_,i)=>'activity-'+i)}}
+ assert.equal(parseCompletionReview(JSON.stringify(review)),undefined)
+ assert.equal(parseCompletionReview(JSON.stringify({...review,implementation:{...review.implementation,evidenceIds:review.implementation.evidenceIds.slice(0,8)}})).status,'complete')
+ assert.equal(parseCompletionReview(JSON.stringify({status:'complete',reason:review.reason})).status,'complete')
+})

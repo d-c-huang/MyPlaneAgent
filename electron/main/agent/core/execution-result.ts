@@ -7,8 +7,8 @@ export function toolData(value:unknown):Record<string,unknown> {
 }
 export const processTools=new Set(['agent.run_command','agent.run_test','agent.run_test_case','agent.build_project','agent.get_diagnostics'])
 export function failureCode(message:string):FailureCode {
-  if(/cancel|abort|取消|中止/i.test(message))return 'cancelled'
   if(/timeout|timed out|超时/i.test(message))return 'timeout'
+  if(/cancel|abort|取消|中止/i.test(message))return 'cancelled'
   if(/budget|上限|预算/i.test(message))return 'budget'
   if(/permission|denied|权限|拒绝|越界|超出.*范围/i.test(message))return 'permission'
   if(/schema|argument|参数|请选择目录|expected.*(?:string|object)/i.test(message))return 'arguments'

@@ -17,7 +17,7 @@ export function operationKey(taskId:string,workspace:string,name:string,args:Rec
 // journal entry must not prevent reuse or restarting a service after app restart.
 // This only controls replay protection; normal capability and approval checks remain.
 export function journalRequired(capability:Capability,args:Record<string,unknown>={}){
-  if(['runtime.current_time','runtime.read_evidence','runtime.check_file'].includes(capability.name))return false
+  if(['runtime.current_time','runtime.read_evidence','runtime.read_history','runtime.check_file'].includes(capability.name))return false
   if(capability.source.type==='mcp')return true
   if(capability.source.type==='builtin')return !previewCapabilityNames.has(capability.name)&&!['browser.open','browser.read_page','browser.inspect','browser.screenshot'].includes(capability.name)
   if(!['agent-tools','git-operations','file-operations'].includes(capability.source.skillId))return true

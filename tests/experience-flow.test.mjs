@@ -8,7 +8,8 @@ import {ExperienceFlow,flowInputs} from '../dist-electron/main/agent/core/experi
 import {SearchHealth} from '../dist-electron/main/agent/search-health.js'
 import {searchOrders} from '../dist-electron/main/agent/search-engines.js'
 import {AgentCoreService} from '../dist-electron/main/agent/agent-core-service.js'
-function setup(t){const directory=fs.mkdtempSync(path.join(os.tmpdir(),'experience-flow-'));t.after(()=>fs.rmSync(directory,{recursive:true,force:true}));let now=Date.now();const store=new ExperienceStore(directory,()=>now);return {directory,store,advance:ms=>now+=ms}}
+import {workspaceCleanup} from './helpers/workspace.mjs'
+function setup(t){const directory=fs.mkdtempSync(path.join(os.tmpdir(),'experience-flow-')),track=workspaceCleanup(t,directory);let now=Date.now();const store=new ExperienceStore(directory,()=>now);return {directory,store,track,advance:ms=>now+=ms}}
 const context=workspace=>({workspace,region:'CN',webEnabled:true,filesEnabled:true,tools:['agent.web_search','agent.web_fetch','agent.read_file']})
 function seed(store,workspace,kind='web'){store.record(kind==='web'?'搜索 Vue 文档':'读取 README.md',workspace,kind==='web'?['agent.web_search','agent.web_fetch']:['agent.read_file'],true);return store.state().entries.at(-1)}
 test('record conversion preserves identity, history and validation gates across reload and rollback',t=>{
@@ -105,7 +106,7 @@ test('regional health requires repeated failures, recovers and expires without s
  now+=86400001;assert.deepEqual(health.state(),[])
 })
 test('trial service validates actual file and requires explicit network permission',async t=>{
- const {directory}=setup(t),service=new AgentCoreService({dataDir:directory,skillsDir:path.join(directory,'skills'),getConnection:()=>({})})
+ const {directory,track}=setup(t),service=track(new AgentCoreService({dataDir:directory,skillsDir:path.join(directory,'skills'),getConnection:()=>({})}))
  const e=seed(service.experiences,directory,'file')
  fs.writeFileSync(path.join(directory,'README.md'),'secret test evidence')
  service.capabilityRegistry.registerBuiltin({name:'agent.read_file',category:'agent',source:{type:'skill',skillId:'agent-tools'},runtime:'builtin',permissions:[],parameters:{type:'object',properties:{path:{type:'string'},startLine:{type:'number'},endLine:{type:'number'}}},tags:[]},async args=>({path:args.path,text:fs.readFileSync(path.join(directory,args.path),'utf8')}))
@@ -135,7 +136,7 @@ test('web alternatives are bounded, deduplicated and never continued after denia
  assert.equal(denied.finished,true);assert.equal(denied.next(),undefined);assert.match(denied.reason,/拒绝/)
 })
 test('trial service tries remaining results before failing and does not persist the samples',async t=>{
- const {directory}=setup(t),service=new AgentCoreService({dataDir:directory,skillsDir:path.join(directory,'skills'),getConnection:()=>({})}),e=seed(service.experiences,directory)
+ const {directory,track}=setup(t),service=track(new AgentCoreService({dataDir:directory,skillsDir:path.join(directory,'skills'),getConnection:()=>({})})),e=seed(service.experiences,directory)
  const calls=[]
  service.capabilityRegistry.get=name=>({name,source:{type:'skill',skillId:'agent-tools'},runtime:'python-native'})
  service.capabilityRegistry.execute=async action=>{
@@ -191,7 +192,7 @@ test('flow distinguishes outage, denial, empty search and bad evidence',t=>{
 })
 
 test('a failed network trial retains enabled certification and records only a safe interruption',async t=>{
- const {directory}=setup(t),service=new AgentCoreService({dataDir:directory,skillsDir:path.join(directory,'skills'),getConnection:()=>({})}),e=seed(service.experiences,directory)
+ const {directory,track}=setup(t),service=track(new AgentCoreService({dataDir:directory,skillsDir:path.join(directory,'skills'),getConnection:()=>({})})),e=seed(service.experiences,directory)
  service.experiences.verify(e.id,1,true,[],'ok');service.enableExperience(e.id,1,true)
  const before=service.experienceState().entries[0].verification
  service.capabilityRegistry.get=name=>({name,source:{type:'skill',skillId:'agent-tools'},runtime:'python-native'})

@@ -6,11 +6,12 @@ import path from 'node:path'
 import {WeatherWorkflow,parseWeatherRequest,weatherDate} from '../dist-electron/main/agent/core/weather-workflow.js'
 import {ExperienceStore} from '../dist-electron/main/agent/core/experience-store.js'
 import {AgentCoreService} from '../dist-electron/main/agent/agent-core-service.js'
+import {workspaceCleanup} from './helpers/workspace.mjs'
 
 const geo={results:[{name:'上海',country_code:'CN',feature_code:'PPLA',latitude:31.22,longitude:121.46,timezone:'Asia/Shanghai'}]}
 const forecast={latitude:31.25,longitude:121.5,timezone:'Asia/Shanghai',daily_units:{temperature_2m_min:'°C',temperature_2m_max:'°C',precipitation_probability_max:'%'},daily:{time:['2026-09-28'],temperature_2m_min:[21],temperature_2m_max:[28],precipitation_probability_max:[65],weather_code:[61]}}
 const signal=()=>new AbortController().signal
-function fixture(t){const directory=fs.mkdtempSync(path.join(os.tmpdir(),'weather-flow-'));t.after(()=>fs.rmSync(directory,{recursive:true,force:true}));return {directory,store:new ExperienceStore(directory)}}
+function fixture(t){const directory=fs.mkdtempSync(path.join(os.tmpdir(),'weather-flow-')),track=workspaceCleanup(t,directory);return {directory,store:new ExperienceStore(directory),track}}
 function options(extra={}){return {workspace:'.',model:'unused',connection:{},messages:[{role:'user',content:'上海明天要带伞吗'}],webEnabled:true,filesEnabled:false,approvalMode:'auto',signal:signal(),approve:async()=>true,onActivity:()=>{},onContent:()=>{},onReasoning:()=>{},onRequest:()=>{throw new Error('simple weather must not require a model')},onUsage:()=>{},...extra}}
 function workflow(reader){return new WeatherWorkflow(reader??(async url=>url.includes('geocoding')?structuredClone(geo):structuredClone(forecast)),()=>new Date('2026-09-27T06:00:00Z'))}
 
@@ -74,8 +75,8 @@ test('network failure records only a candidate and returns to general tools; can
  assert.equal(store.state().entries[0].failures,0);assert.equal(store.state().entries[0].interruptions,1)
 })
 test('conversation service routes simple weather before model planning and saves actual evidence',async t=>{
- const {directory}=fixture(t)
- const service=new AgentCoreService({dataDir:directory,skillsDir:path.join(directory,'skills'),getConnection:()=>({})})
+ const {directory,track}=fixture(t)
+ const service=track(new AgentCoreService({dataDir:directory,skillsDir:path.join(directory,'skills'),getConnection:()=>({})}))
  service.initialized=true;service.weather=workflow();let saved,outcome,text=''
  const query='上海明天要带伞吗'
  await service.runConversation(options({planExecution:{taskId:'weather-task',goal:query,save:value=>saved=value},onOutcome:v=>outcome=v,onContent:v=>text+=v}))

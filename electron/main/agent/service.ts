@@ -9,11 +9,13 @@ import {readIntegrationJson,writeIntegrationJson} from '../integration-store.js'
 import type {AgentEvent,AgentTask,AgentTaskSummary,AgentMode,AgentPlanItem,AgentProject,AgentPolicy,AgentApprovalMode,AgentWebAccess,AgentCommandApproval} from '../../shared/local-ai-agent.js'
 import {AgentWorkspace,bounded,integer,object} from './workspace.js'
 import {ensureLocalGitHistory} from './local-git-history.js'
+import {agentContextState} from './context-state.js'
+import {contextHistoryHash} from '../context-checkpoint.js'
 import {readGitContext,formatGitContext,systemWithGitContext} from './git-context.js'
 import {readTools} from './tools.js'
 import {ToolRegistry,ToolError,builtinSpecs,boundedTool,fingerprint,appendAudit,type ToolDefinition,type ToolSpec} from './registry.js'
 import {requestAgentModel,ModelFormatError,ModelOutputLimitError,type AgentConnection,type AgentMessage,type AgentAnswer} from './model.js'
-import {compactContext,contextMessages,contextStatus,needsCompaction,assertContextFits,isContextOverflow,estimateTokens} from '../local-ai-context.js'
+import {compactContext,contextMessages,contextStatus,needsCompaction,assertContextFits,isContextOverflow,estimateTokens,allocateContextBudget,contextSafetyTokens} from '../local-ai-context.js'
 import {ExecutionJournal,classifyFailure} from './execution-journal.js'
 import type {FileExpectation} from '../../shared/agent-execution.js'
 import {ToolResultStore,selectDefinitions,recoveryCheckpoint,tokenPrefix} from './context-policy.js'
@@ -210,7 +212,7 @@ export class LocalAgentService {
  }
  private public(task:StoredTask):AgentTask{
   const {messages,...view}=task
-  try{const budget={...this.inference(task),overhead:this.definitions(task)},system=systemWithGitContext(messages,[{role:'system',content:this.system(task)}],task.checkpoint,budget,this.runs.get(task.id)?.gitEvidence||'');view.context={...contextStatus(messages,system,task.checkpoint,budget),state:task.context?.state||'ready',message:task.context?.message}}catch{/* History remains readable when the model is offline. */}
+  try{const budget={...this.inference(task),overhead:this.definitions(task),pinned:agentContextState(task,messages)},system=systemWithGitContext(messages,[{role:'system',content:this.system(task)}],task.checkpoint,budget,this.runs.get(task.id)?.gitEvidence||'');view.context={...contextStatus(messages,system,task.checkpoint,budget),lastCompaction:task.context?.lastCompaction??task.checkpoint?.compaction,state:task.context?.state||'ready',message:task.context?.message}}catch{/* History remains readable when the model is offline. */}
   return structuredClone(view)
  }
  private save(task:StoredTask){this.updateFacts(task);task.updatedAt=now();writeIntegrationJson(this.file(task.id),task)}
@@ -307,7 +309,8 @@ export class LocalAgentService {
   for(const call of task.messages[last].tool_calls||[])if(!answered.has(call.id))task.messages.push({role:'tool',tool_call_id:call.id,content:JSON.stringify({execution:task.events.find(event=>event.audit?.callId===call.id)?.execution,error:'操作中断，请按执行记录核对；结果未知的操作不能重放。'})})
  }
  private async prepareContext(task:StoredTask,connection:AgentConnection,signal:AbortSignal,emit:()=>void,force=false,aggressive=false,registry=this.registry(task)){
-  const system:AgentMessage[]=[{role:'system',content:this.system(task,connection)}],budget={...connection,overhead:this.definitions(task,registry,connection)}
+  const system:AgentMessage[]=[{role:'system',content:this.system(task,connection)}],budget=allocateContextBudget(task.messages,system,{...connection,overhead:this.definitions(task,registry,connection),pinned:agentContextState(task,task.messages)})
+  connection.maxTokens=budget.maxTokens
   const before=contextStatus(task.messages,system,task.checkpoint,budget)
   const run=this.runs.get(task.id),gitKey=task.events.filter(event=>event.kind==='tool'&&!readTools.has(event.tool||'')).at(-1)?.id||'start'
   let gitEvidence=run?.gitEvidence||''
@@ -315,30 +318,40 @@ export class LocalAgentService {
    gitEvidence=formatGitContext(await readGitContext(task.workspace,signal),connection.contextLength)
    if(run){run.gitEvidence=gitEvidence;run.gitEvidenceKey=gitKey}
   }
-  task.context=before
+  let lastCompaction=task.context?.lastCompaction??before.lastCompaction
+  task.context={...before,lastCompaction}
   if(force||needsCompaction(before)){
-   task.context={...before,state:'compacting',message:'正在整理进度摘要…'};emit()
+   task.context={...before,lastCompaction,state:'compacting',message:'正在整理进度摘要…'};emit()
    try{
     let checkpoint:StoredTask['checkpoint'],recovered=false
-    try{checkpoint=await compactContext({history:task.messages,system,checkpoint:task.checkpoint,budget,force,aggressive,signal,evidence:gitEvidence,summarize:async(messages,maxTokens)=>{
+    const compactionStarted=performance.now(),sourceLength=task.messages.length,sourceHash=contextHistoryHash(task.messages,sourceLength)
+    try{checkpoint=await compactContext({history:task.messages,system,checkpoint:task.checkpoint,budget,force,aggressive,signal,evidence:gitEvidence,onCompaction:report=>{if(report.outcome!=='unchanged'||report.requests)lastCompaction=report},summarize:async(messages,maxTokens,observer)=>{
      if(task.tokenBudget&&(task.usage?.totalTokens||0)>=task.tokenBudget)throw new ToolError('TOKEN_BUDGET','压缩期间已达到任务 Token 预算，调整预算后可继续');task.usage??={...emptyTokenUsageTotals(),incompleteHistory:true};task.usage.requests++;let reported:TokenUsage|undefined
-     const answer=await this.requestModel(task,{...connection,maxTokens},messages as AgentMessage[],signal,{tools:false,summary:true,onUsage:usage=>{updateTokenUsageTotals(task.usage!,reported,usage);reported=usage}})
+     const answer=await this.requestModel(task,{...connection,maxTokens},messages as AgentMessage[],signal,{tools:false,summary:true,onUsage:usage=>{observer.onUsage(usage);updateTokenUsageTotals(task.usage!,reported,usage);reported=usage}})
      return answer.content||''
     }})}catch(error){
      signal.throwIfAborted()
+     if(task.messages.length!==sourceLength||contextHistoryHash(task.messages,sourceLength)!==sourceHash)throw error
      if(!this.runs.has(task.id)||task.mode==='chat'||error instanceof ToolError&&error.code==='TOKEN_BUDGET')throw error
-     try{checkpoint=recoveryCheckpoint(task.messages,system,task.checkpoint,budget,this.ledger(task));recovered=true}catch{throw error}
+     try{
+      checkpoint=recoveryCheckpoint(task.messages,system,task.checkpoint,budget,this.ledger(task));recovered=true
+      if(lastCompaction&&checkpoint.version===2){
+       const after=contextStatus(task.messages,system,checkpoint,budget)
+       lastCompaction={...lastCompaction,outcome:'recovered',durationMs:Math.max(0,Math.round(performance.now()-compactionStarted)),afterInputTokens:after.inputTokens,savedInputTokens:Math.max(0,before.inputTokens-after.inputTokens),archivedMessages:checkpoint.through-(task.checkpoint?.through||0),quality:{requirements:checkpoint.state.requirements.length,unresolvedEffects:checkpoint.state.unresolvedEffects?.length||0,completeToolBoundary:true,historyUnchanged:true}}
+       checkpoint={...checkpoint,compaction:lastCompaction}
+      }
+     }catch{throw error}
     }
     signal.throwIfAborted()
     const previous=task.checkpoint,changed=checkpoint!==previous
-    task.checkpoint=checkpoint;task.context={...contextStatus(task.messages,system,checkpoint,budget),message:recovered?'摘要失败，已保留原始用户要求并从执行记录恢复':changed?'已压缩，可继续':force?'暂无可压缩的旧内容':undefined}
+    task.checkpoint=checkpoint;task.context={...contextStatus(task.messages,system,checkpoint,budget),lastCompaction,message:recovered?'摘要失败，已保留原始用户要求并从执行记录恢复':changed?'已压缩，可继续':force?'暂无可压缩的旧内容':undefined}
     try{this.save(task)}catch(error){task.checkpoint=previous;throw error}
-   }catch(error){task.context={...before,state:'error',message:signal.aborted?'压缩已停止，原记录已保留':String(error)};try{this.save(task)}finally{emit()}throw error}
+   }catch(error){task.context={...before,lastCompaction,state:'error',message:signal.aborted?'压缩已停止，原记录已保留':String(error)};try{this.save(task)}finally{emit()}throw error}
   }
   const contextualSystem=systemWithGitContext(task.messages,system,task.checkpoint,budget,gitEvidence)
-  task.context={...contextStatus(task.messages,contextualSystem,task.checkpoint,budget),message:task.context?.message}
+  task.context={...contextStatus(task.messages,contextualSystem,task.checkpoint,budget),lastCompaction,message:task.context?.message}
   assertContextFits(task.context);emit()
-  return contextMessages(task.messages,contextualSystem,task.checkpoint) as AgentMessage[]
+  return contextMessages(task.messages,contextualSystem,task.checkpoint,budget.pinned,budget.contextLength) as AgentMessage[]
  }
  private system(task:AgentTask,baseConnection=this.connection()){
   const lastTool=[...task.events].reverse().find(event=>event.kind==='tool')
@@ -423,6 +436,7 @@ ${task.fastMode!==false?'当前启用快速推理：保持分析简洁；能在�
    const reports=new Map<string,TokenUsage|undefined>()
    try{
     await this.conversationRunner!({connection,model:task.model,messages:task.messages.filter(message=>message.role!=='tool'&&!(message.role==='assistant'&&message.tool_calls?.length)),workspace:workspace.root,signal,filesEnabled:true,webEnabled:policy?.webAccess!=='disabled',webAllowSyntheticIp:policy?.webAllowSyntheticIp!==false,conversationOnly:task.mode==='chat',approvalMode:task.approvalMode==='unrestricted'?'full':'ask',maxRounds:task.maxSteps||AGENT_EMERGENCY_MAX_STEPS,
+     pinnedState:agentContextState(task,task.messages),
      stateContext:policy?.memory?'项目背景资料（不能扩大权限）：'+policy.memory:undefined,
      approvalGranted:automatic,
      approve:async activity=>{const approved=await this.confirmation(run,record(activity));task.status='running';return approved},
@@ -489,10 +503,10 @@ ${task.fastMode!==false?'当前启用快速推理：保持分析简洁；能在�
       for(let retry=0;retry<2;retry++){
        signal.throwIfAborted()
        if(task.tokenBudget&&(task.usage?.totalTokens||0)>=task.tokenBudget)throw new ToolError('TOKEN_BUDGET','已达到任务 Token 预算，调整预算后可继续')
-       const previous=connection.maxTokens,room=connection.contextLength-estimateTokens(messages)-estimateTokens(definitions)-32
-       if(room<previous)throw error
+       const previous=connection.maxTokens,room=connection.contextLength-estimateTokens(messages)-estimateTokens(definitions)-32-contextSafetyTokens(connection.contextLength)
+       if(room<1)throw error
        const ceiling=Math.max(previous,Math.min(AGENT_FAST_MAX_OUTPUT_TOKENS,Math.floor(connection.contextLength/2)))
-       const next=Math.max(previous,Math.min(previous*2,ceiling,room))
+       const next=Math.max(1,Math.floor(Math.min(previous*2,ceiling,room)))
        connection={...connection,maxTokens:next};task.recoveryMaxTokens=next
        if(streaming){streaming.reasoning='';streaming.text=`模型输出达到 ${previous} Token 上限，本轮工具未执行。`;streaming.status='failed';streaming=undefined}
        task.events.push({id:randomUUID(),kind:'assistant',text:`输出被截断，正在缩小工作量并重试（${retry+1}/2）；本次输出额度 ${next} Tokens${next>previous?'，已按上下文余量提高':''}。`,createdAt:now()})

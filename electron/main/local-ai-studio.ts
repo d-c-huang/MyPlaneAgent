@@ -25,6 +25,7 @@ import {validBackgroundImage,backgroundOpacity} from '../shared/app-background.j
 import { modelCapacity, ModelContextCapacityError } from './agent/model-budget.js';
 import type { ChatRunOptions } from './agent/core/chat-runner.js';
 import { ExecutionInspector } from './agent/core/execution-inspector.js';
+import {sessionContextState} from './agent/context-state.js';
 import {externalModelPerformance} from './external-model-performance.js';
 import { workflowValidationMessage } from "../shared/workflow-validation.js";
 import {
@@ -35,6 +36,7 @@ import {
   assertContextFits,
   isContextOverflow,
   inferenceBudget,
+  allocateContextBudget,
   type ContextMessage,
 } from "./local-ai-context.js";
 import { requestAgentModel, type AgentConnection, type AgentMessage } from "./agent/model.js";
@@ -1736,6 +1738,7 @@ export class LocalAiStudioService extends LocalAiService {
   }
   private chatHistory(session: StudioSession): ContextMessage[] {
     return taskMessages(session).map((item) => ({
+      id:item.id,
       role: item.role,
       content: item.role === 'assistant' && item.toolActivity?.length ? `${item.content}\n\n本轮工具记录（资料）：\n${JSON.stringify(item.toolActivity.map(({fileChanges: _fileChanges,images:storedImages,...activity}) => ({...activity,...(storedImages?.length?{imageNote:'截图原件保存在该工具记录；当前文字摘要不能替代图片，核验当前画面时重新截图。'}:{}), output: activity.output && activity.output.length > 2400 ? activity.output.slice(0, 1200) + '\n[中间输出省略，完整记录仍保存在会话中]\n' + activity.output.slice(-1200) : activity.output})))}` : chatMessageContent(item),
     }));
@@ -1749,12 +1752,12 @@ export class LocalAiStudioService extends LocalAiService {
     session: StudioSession,
     settings = this.inferenceSettings(session.model),
   ) {
-    return contextStatus(
+    return {...contextStatus(
       this.chatHistory(session),
       this.chatSystem(session),
       session.checkpoint,
-      settings,
-    );
+      {...settings,pinned:sessionContextState(session,this.chatHistory(session),this.agent.projects().find(project=>project.id===session.projectId)?.workspace)},
+    ),...(session.context?.lastCompaction?{lastCompaction:session.context.lastCompaction}:{})};
   }
   private async prepareChatContext(
     session: StudioSession,
@@ -1773,7 +1776,10 @@ export class LocalAiStudioService extends LocalAiService {
   ): Promise<ContextMessage[]> {
     const history = this.chatHistory(session),
       system = this.chatSystem(session),
-      before = this.chatContextStatus(session, settings);
+      pinned=sessionContextState(session,history,gitWorkspace||this.agent.projects().find(project=>project.id===session.projectId)?.workspace);
+    if(gitWorkspace)pinned.permissions={...pinned.permissions,workspace:gitWorkspace,filesEnabled:true};
+    const budget=allocateContextBudget(history,system,{...settings,pinned}),before=contextStatus(history,system,session.checkpoint,budget);
+    settings.maxTokens=budget.maxTokens;
     session.context = before;
     const publish = () =>
       emit({
@@ -1794,12 +1800,13 @@ export class LocalAiStudioService extends LocalAiService {
           history,
           system,
           checkpoint: session.checkpoint,
-          budget: settings,
+          budget,
           signal,
           force,
           aggressive,
           evidence:gitWorkspace?formatGitContext(await readGitContext(gitWorkspace,signal),settings.contextLength):undefined,
-          summarize: async (messages, maxTokens) => {
+          onCompaction:report=>{if(report.outcome!=='unchanged'||report.requests)session.context={...session.context!,lastCompaction:report}},
+          summarize: async (messages, maxTokens, observer) => {
             session.usage!.requests++;
             let previous: TokenUsage | undefined;
             const answer = await requestAgentModel(
@@ -1816,6 +1823,7 @@ export class LocalAiStudioService extends LocalAiService {
                 tools: false,
                 summary: true,
                 onUsage: (usage) => {
+                  observer.onUsage(usage);
                   updateTokenUsageTotals(session.usage!, previous, usage);
                   previous = usage;
                 },
@@ -1849,6 +1857,7 @@ export class LocalAiStudioService extends LocalAiService {
         }
         session.context = {
           ...before,
+          lastCompaction:session.context?.lastCompaction,
           state: "error",
           message: signal.aborted ? "压缩已停止，原记录已保留" : String(error),
         };
@@ -1858,7 +1867,7 @@ export class LocalAiStudioService extends LocalAiService {
     }
     assertContextFits(session.context);
     publish();
-    return contextMessages(history, system, session.checkpoint);
+    return contextMessages(history, system, session.checkpoint,budget.pinned,budget.contextLength);
   }
   private async generate(
     session: StudioSession,
@@ -2041,6 +2050,7 @@ export class LocalAiStudioService extends LocalAiService {
         conversationOnly: !taskRunId&&socialConversationMessage(session.messages.filter(message=>message.role==='user').at(-1)?.content||''),
         readOnlyConversation: !taskRunId&&projectOverviewQuestion(session.messages.filter(message=>message.role==='user').at(-1)?.content||''),
         model:session.model, messages:messages as AgentMessage[], signal, temperature:settings.temperature,
+        pinnedState:sessionContextState(session,this.chatHistory(session),toolOptions!.workspace),
         visualDecision:session.messages.filter(message=>message.role==='user').at(-1)?.visualDecision,
         imageCapability,imageBudget:{remaining:Math.max(0,maxSessionImageChars-storedImageChars)},
         beforeExecution: taskRunId ? (capability,args)=>{

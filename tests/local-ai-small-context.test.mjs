@@ -76,7 +76,7 @@ test('failed model summaries recover a completed write without replaying it and 
   assert.match(JSON.stringify(body.messages),/customer_id/);assert.match(JSON.stringify(body.messages),/禁止部署/)
   return response('已完成写入，继续核对。')
  })
- const first=h.start();await until(()=>!h.service.active(first.id));assert.equal(h.service.get(first.id).status,'completed')
+ const first=h.start();await until(()=>!h.service.active(first.id));assert.equal(h.service.get(first.id).status,'completed',h.service.get(first.id).error)
  const file=path.join(h.directory,first.id+'.json'),saved=JSON.parse(fs.readFileSync(file,'utf8'))
  saved.messages.push({role:'assistant',content:'旧工具资料'.repeat(5000)})
  fs.writeFileSync(file,JSON.stringify(saved))
@@ -84,6 +84,35 @@ test('failed model summaries recover a completed write without replaying it and 
  h.start({taskId:first.id,prompt:'继续验证，不重复写入。'});await until(()=>!h.service.active(first.id))
  const task=h.service.get(first.id);assert.equal(task.status,'completed',task.error);assert.ok(summaries>0);assert.equal(task.checkpoint.source,'recovery')
  assert.equal(task.events.filter(event=>event.tool==='write_file').length,count);assert.deepEqual(task.facts.changedFiles,['saved.txt']);assert.equal(fs.readFileSync(path.join(h.workspace,'saved.txt'),'utf8'),'done')
+ assert.equal(task.context.lastCompaction.outcome,'recovered')
+ assert.equal(task.checkpoint.compaction.outcome,'recovered')
+ assert.ok(task.checkpoint.compaction.requests>0);assert.equal(task.checkpoint.compaction.usage.totalReports,0)
+ const reopened=new LocalAgentService(h.directory,h.connection);t.after(()=>reopened.dispose())
+ assert.deepEqual(reopened.get(first.id).context.lastCompaction,task.context.lastCompaction)
+})
+
+test('legacy recovery cannot mark changed history as validated after a summary fails',async t=>{
+ let changeHistory=false,first
+ const h=await harness(t,body=>{
+  if(!body.tools){
+   if(changeHistory){
+    h.service.runs.get(first.id).task.messages.push({role:'user',content:'并发新增要求：禁止上传任何文件。'})
+    throw new Error('summary failed after history changed')
+   }
+   return response('用户要求保留 customer_id，禁止部署。')
+  }
+  return response('尚未修改文件。')
+ })
+ first=h.start();await until(()=>!h.service.active(first.id))
+ const file=path.join(h.directory,first.id+'.json'),saved=JSON.parse(fs.readFileSync(file,'utf8'))
+ saved.messages.push({role:'assistant',content:'历史日志'.repeat(5000)})
+ fs.writeFileSync(file,JSON.stringify(saved));changeHistory=true
+ h.start({taskId:first.id,prompt:'继续核对现有数据'});await until(()=>!h.service.active(first.id))
+ const after=JSON.parse(fs.readFileSync(file,'utf8'))
+ assert.deepEqual(after.checkpoint,saved.checkpoint)
+ assert.match(after.error,/历史已变化/)
+ assert.equal(after.context.lastCompaction.outcome,'failed');assert.equal(after.context.lastCompaction.quality,undefined)
+ assert.ok(after.messages.some(message=>message.content==='并发新增要求：禁止上传任何文件。'))
 })
 
 test('small context rejects a batch before executing any write and retries one tool',async t=>{

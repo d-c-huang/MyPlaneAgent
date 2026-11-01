@@ -3,7 +3,7 @@ import path from 'node:path'
 import {execFile} from 'node:child_process'
 import {promisify} from 'node:util'
 import {AgentWorkspace} from './workspace.js'
-import {contextStatus,estimateTokens,type ContextBudget,type ContextMessage} from '../local-ai-context.js'
+import {contextStatus,contextOccupancy,estimateTokens,type ContextBudget,type ContextMessage} from '../local-ai-context.js'
 import type {ContextCheckpoint} from '../../shared/local-ai-context.js'
 
 const execute=promisify(execFile)
@@ -73,5 +73,5 @@ export function systemWithGitContext(history:ContextMessage[],system:ContextMess
  const next=[...system,{role:'system',content:evidence}]
  const status=contextStatus(history,next,checkpoint,budget)
  // Optional evidence must not displace user constraints or cause a context overflow.
- return status.inputTokens+status.reservedOutput<=status.capacity*.95?next:system
+ return contextOccupancy(status)<=status.capacity?next:system
 }

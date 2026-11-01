@@ -69,7 +69,7 @@ test('replace_text can target a repeated snippet by its current line without cha
 test('custom FAIL lines are reported as assertion failures with individual test names',()=>{
  const script="import sys,json;sys.path.insert(0,'python');from agent_tools_worker import test_failure_analysis;print(json.dumps(test_failure_analysis(sys.stdin.read(),1)))"
  const output='  FAIL  空盘迭代加深返回合法着法 — 无着法\n  FAIL  二次搜索命中置换表 — hits=0\n===== 汇总：78 通过 / 2 失败 ====='
- const run=spawnSync(python,['-c',script],{input:output,encoding:'utf8'})
+ const run=spawnSync(python,['-c',script],{input:output,encoding:'utf8',env:{...process.env,PYTHONUTF8:'1'}})
  assert.equal(run.status,0,run.stderr)
  const analysis=JSON.parse(run.stdout)
  assert.equal(analysis.category,'assertion')

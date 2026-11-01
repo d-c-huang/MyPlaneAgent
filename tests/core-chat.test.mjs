@@ -16,6 +16,7 @@ import {runTaskPlan,parseTaskItems} from '../dist-electron/main/agent/core/task-
 import {weatherDate} from '../dist-electron/main/agent/core/weather-workflow.js'
 import {createTaskScope} from '../dist-electron/shared/task-scope.js'
 import {ExecutionInspector} from '../dist-electron/main/agent/core/execution-inspector.js'
+import {isolatedGitWorkspace,workspaceCleanup} from './helpers/workspace.mjs'
 
 test('inspection edits reach approval, execution and subsequent model history',async()=>{
  const controller=new AbortController(),inspector=new ExecutionInspector(controller.signal,true),executions=[],approvals=[]
@@ -37,8 +38,8 @@ test('read-only weather task does not expose unrelated project diagnostics',()=>
 })
 
 test('successful general weather lookup learns source method instead of tool sequence',async t=>{
- const workspace=mkdtempSync(path.join(tmpdir(),'weather-learning-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
- const service=new AgentCoreService({dataDir:path.join(workspace,'data'),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})});service.initialized=true
+ const workspace=mkdtempSync(path.join(tmpdir(),'weather-learning-')),track=workspaceCleanup(t,workspace)
+ const service=track(new AgentCoreService({dataDir:path.join(workspace,'data'),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})}));service.initialized=true
  service.weather.run=async()=>false
  let reads=0,outcome
  service.capabilityRegistry.registerBuiltin({...capability('agent.web_fetch','read'),runtime:'builtin',parameters:{type:'object',properties:{url:{type:'string'}},required:['url']}},async args=>{reads++;return {url:args.url,text:`上海 ${weatherDate('明天','Asia/Shanghai',new Date())} 天气预报 20℃`}})
@@ -52,8 +53,8 @@ test('successful general weather lookup learns source method instead of tool seq
 })
 
 test('weather conversation uses learned source with fresh city and date before builtin provider',async t=>{
- const workspace=mkdtempSync(path.join(tmpdir(),'weather-method-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
- const service=new AgentCoreService({dataDir:path.join(workspace,'data'),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})});service.initialized=true
+ const workspace=mkdtempSync(path.join(tmpdir(),'weather-method-')),track=workspaceCleanup(t,workspace)
+ const service=track(new AgentCoreService({dataDir:path.join(workspace,'data'),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})}));service.initialized=true
  service.experiences.record('上海明天天气',workspace,['browser.open','browser.read_page','agent.web_fetch','agent.web_fetch'],true,undefined,'validation','weather.example')
  const entry=service.experienceState().entries[0],calls=[]
  service.experiences.verify(entry.id,1,true,[],'通过');service.enableExperience(entry.id,1,true)
@@ -371,9 +372,13 @@ test('nonzero verification exit code yields to the bounded scheduler immediately
 
 test('unchanged edits receive one bounded automatic recovery before stopping',async t=>{
  const workspace=mkdtempSync(path.join(tmpdir(),'myplane-unchanged-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
- let edits=0,reads=0,outcome,content=''
+ let edits=0,reads=0,outcome,content='',rounds=0
  const write={...capability('agent.write_file'),parameters:{type:'object',properties:{path:{type:'string'},content:{type:'string'}},required:['path','content']}}
- await withModel((input,n)=>n%2?toolCall(input,'agent.write_file',{path:'./'.repeat(n)+'same.txt',content:'same'}):toolCall(input,'agent.read_file',{query:'read-'+n}),async connection=>{
+ await withModel(input=>{
+  if(!input.tools)return {content:'此前编辑未改变文件；需要核对实际内容，不能宣称修复完成。'}
+  const n=++rounds
+  return n%2?toolCall(input,'agent.write_file',{path:'./'.repeat(n)+'same.txt',content:'same'}):toolCall(input,'agent.read_file',{query:'read-'+n})
+ },async connection=>{
   await runCoreChat({list:()=>[write,capability('agent.read_file','read')],execute:async request=>request.capability==='agent.write_file'?(edits++,{success:true,output:{status:'unchanged',changed:false,paths:[],unchangedPaths:[request.args.path]}}):(reads++,{success:true,output:'read evidence '+reads})},options(connection,{workspace,approvalMode:'full',filesEnabled:true,onOutcome:value=>outcome=value,onContent:value=>content+=value}))
  })
  assert.equal(edits,6);assert.equal(reads,5);assert.equal(outcome,'blocked');assert.match(content,/仍未产生有效修改/)
@@ -494,17 +499,101 @@ test('execution journal stops repeated successful commands before executing them
 const capability = (name, risk = 'high') => ({name,category:'agent',description:name,parameters:{type:'object',properties:{query:{type:'string'}},required:['query']},source:{type:'skill',skillId:'agent-tools'},runtime:'python-native',permissions:['network'],tags:risk==='read'?[]:['requires-approval',`risk:${risk}`]})
 async function withModel(call, work, reviewCall) {
   const requests=[]
+  let modelError
   const server=createServer(async(request,response)=>{
+   try{
     let body='';for await(const part of request)body+=part
     const input=JSON.parse(body);requests.push(input)
     const isReview=input.messages.some(item=>item.role==='system'&&String(item.content).includes('你是任务完成检查器'))
     const message=isReview ? (reviewCall ? await reviewCall(input) : {content:JSON.stringify({status:'complete',reason:'已完成',nextStep:''})}) : await call(input,requests.length)
     response.setHeader('content-type','application/json')
     response.end(JSON.stringify({choices:[{finish_reason:message.finish_reason || (message.tool_calls?'tool_calls':'stop'),message}],usage:{prompt_tokens:30,completion_tokens:5}}))
+   }catch(error){
+    modelError??=error
+    response.writeHead(500,{'content-type':'application/json'})
+    response.end(JSON.stringify({error:{message:String(error)}}))
+   }
   })
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve))
-  try{await work({endpoint:`http://127.0.0.1:${server.address().port}/v1`,key:'',maxTokens:1024,contextLength:8192},requests)}finally{await new Promise(resolve=>server.close(resolve))}
+  try{
+   await work({endpoint:`http://127.0.0.1:${server.address().port}/v1`,key:'',maxTokens:1024,contextLength:8192},requests)
+   if(modelError)throw modelError
+  }catch(error){throw modelError??error}
+  finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve))}
 }
+
+test('mock model assertion failures propagate and close the server instead of hanging',{timeout:5000},async()=>{
+ await assert.rejects(withModel(()=>assert.fail('model fixture assertion'),async connection=>{
+  await runCoreChat({list:()=>[],execute:async()=>assert.fail('no tools expected')},options(connection))
+ }),/model fixture assertion/)
+})
+
+test('read-only completion prompts omit implementation evidence instead of soliciting an unbounded history list',async()=>{
+ let outcome,reviews=0
+ await withModel(()=>({content:'全部批次已按原文核对。'}),async connection=>{
+  await runCoreChat({list:()=>[],execute:async()=>assert.fail('no replay needed')},options(connection,{onOutcome:value=>outcome=value}))
+ },input=>{
+  reviews++
+  const instruction=input.messages.filter(row=>row.role==='system').map(row=>row.content).join('\n')
+  assert.match(instruction,/必须省略 implementation 字段/)
+  assert.match(instruction,/逐字核对完整值，包括前后缀/)
+  if(reviews===1)return {content:JSON.stringify({status:'complete',reason:'原文已齐全',implementation:{status:'present',evidenceIds:Array.from({length:9},(_,i)=>'old-'+i)}})}
+  assert.match(instruction,/上次完成检查未返回有效格式/)
+  return {content:JSON.stringify({status:'complete',reason:'原文已齐全'})}
+ })
+ assert.equal(reviews,2);assert.equal(outcome,'complete')
+})
+
+test('short history pages resume automatic compaction after the growth window, before a hard overflow',async()=>{
+ let pages=0
+ const metrics=[],seen=new Set()
+ await withModel(input=>{
+  if(String(input.messages[0]?.content).startsWith('仅压缩历史'))return {content:'历史已整理；继续按页读取，不重复操作。'}
+  return pages<12?toolCall(input,'runtime.read_history',{query:'page-'+pages}):{content:'已经逐页读取12页原文。'}
+ },async connection=>{
+  await runCoreChat({list:()=>[capability('runtime.read_history','read')],execute:async()=>({success:true,output:{workerId:'worker',generation:1,text:`page-${++pages}: `+'source '.repeat(100),offset:pages*700}})},options(connection,{
+   messages:[{role:'user',content:'逐页回读12页历史原文。'},{role:'assistant',content:'old log '.repeat(4000)},{role:'user',content:'继续回读'}],
+   onContext:status=>{const report=status.lastCompaction;if(report?.outcome==='compressed'&&!seen.has(report.startedAt)){seen.add(report.startedAt);metrics.push(report)}},
+  }))
+ })
+ assert.equal(pages,12);assert.ok(metrics.length>=2)
+ assert.ok(metrics.slice(1).some(report=>report.beforeInputTokens+report.reservedOutput+report.safetyTokens<report.capacity),'growth-based compaction should resume before the hard limit')
+ assert.ok(metrics.length<pages,'do not summarize every page')
+})
+
+test('tool reload after model admission refreshes the next step and asks under the new policy',async()=>{
+ const registry=new CapabilityRegistry({getAllTools:()=>[]})
+ let requests=0,oldCalls=0,newCalls=0,approvals=0,outcome
+ const old={...capability('agent.read_file','read'),runtime:'builtin',description:'original provider'}
+ const replacement={...capability('agent.read_file','high'),runtime:'builtin',description:'reloaded provider'}
+ registry.registerBuiltin(old,async()=>{oldCalls++;return 'old'})
+ await withModel(input=>newCalls?{content:'已通过更新后的工具读取结果。'}:toolCall(input,'agent.read_file',{query:input.tools[0].function.description.includes('reloaded')?'new':'old'}),async(connection,bodies)=>{
+  await runCoreChat(registry,options(connection,{filesEnabled:true,onRequest:()=>{if(++requests===1)registry.registerBuiltin(replacement,async()=>{newCalls++;return 'fresh'})},approve:async()=>{approvals++;return true},onOutcome:value=>outcome=value}))
+  const turns=bodies.filter(body=>body.tools?.length)
+  assert.equal(turns[0].tools[0].function.name,turns[1].tools[0].function.name)
+  assert.match(turns[0].tools[0].function.description,/original/);assert.match(turns[1].tools[0].function.description,/reloaded/)
+  assert.ok(turns[1].messages.some(row=>row.role==='tool'&&String(row.content).includes('tool-admission-changed')))
+ })
+ assert.equal(oldCalls,0);assert.equal(newCalls,1);assert.equal(approvals,1);assert.equal(outcome,'complete')
+})
+
+test('withdrawn research providers refresh browser facts and do not force a stale web handoff correction',async()=>{
+ const registry=new CapabilityRegistry({getAllTools:()=>[]}),browser={...capability('browser.read_page','read'),source:{type:'builtin'},runtime:'builtin'}
+ registry.registerBuiltin(browser,async()=>assert.fail('withdrawn provider must not run'))
+ registry.registerBuiltin({...capability('agent.web_search','read'),runtime:'builtin'},async()=>assert.fail('withdrawn search must not run'))
+ let calls=0
+ await withModel(input=>{
+  if(++calls===1)return toolCall(input,'browser.read_page',{query:'page'})
+  assert.equal(input.tools?.length||0,0)
+  const instructions=input.messages.filter(row=>row.role==='system').map(row=>row.content).join('\n')
+  assert.match(instructions,/本轮实际浏览器工具：无/)
+  assert.doesNotMatch(instructions,/本轮已实际提供以下联网工具/)
+  return {content:'建议你自行访问网站 https://example.org；当前没有可用的网页读取工具。'}
+ },async connection=>{
+  await runCoreChat(registry,options(connection,{messages:[{role:'user',content:'读取 https://example.org'}],onRequest:()=>{if(calls===0){registry.unregister(browser.name);registry.unregister('agent.web_search')}}}))
+ })
+ assert.equal(calls,2,'a removed provider cannot trigger a correction claiming it is still available')
+})
 
 test('chat discards truncated tool calls and recovers with bounded output without executing partial work',async()=>{
  const executions=[], progress=[];let count=0,usage=0
@@ -662,7 +751,8 @@ test('stale network denial in continued history is corrected with actual tool na
  await withModel((input,n)=>n===1?{content:'当前可用的工具中**没有联网搜索或网页读取能力**，http_request 仅限 localhost。'}:n===2?toolCall(input,'agent.web_search',{query:'上海明天天气'}):{content:'已取得天气资料'},async(connection,requests)=>{
   await runCoreChat({list:()=>[capability('agent.web_search'),capability('agent.web_fetch')],execute:async()=>{executed++;return {success:true,output:'天气资料'}}},options(connection,{messages:[{role:'user',content:'上海明天下雨不？'},{role:'assistant',content:'没有联网搜索或网页读取能力'},{role:'user',content:'继续'}],approvalMode:'full',onContent:value=>text+=value}))
   assert.equal(executed,1);assert.equal(text,'已取得天气资料')
-  assert.ok(requests[0].messages.some(m=>m.role==='system'&&m.content.includes('agent.web_search → cap_0_agent_web_search')))
+  const actualName=requests[0].tools.find(tool=>tool.function.description.startsWith('agent.web_search:')).function.name
+  assert.ok(requests[0].messages.some(m=>m.role==='system'&&m.content.includes('agent.web_search → '+actualName)))
   assert.ok(requests[1].messages.some(m=>m.role==='system'&&m.content.includes('与实际工具列表不符')))
   assert.equal(requests[1].messages.filter(m=>m.role==='assistant').length,1,'discard the new false claim while keeping original history')
  })
@@ -684,7 +774,7 @@ test('network disabled does not trigger a false denial correction',async()=>{
 })
 
 test('project chat initializes local Git before inference, while ordinary chat leaves its directory untouched',async()=>{
- const workspace=mkdtempSync(path.join(tmpdir(),'myplane-chat-git-'))
+ const workspace=isolatedGitWorkspace('myplane-chat-git-')
  try{
   let shouldExist=false
   await withModel(()=>{
@@ -704,7 +794,7 @@ test('project chat initializes local Git before inference, while ordinary chat l
 })
 
 test('chat file writes save complete snapshots and local Git versions without sending snapshots to the model',async()=>{
- const workspace=mkdtempSync(path.join(tmpdir(),'myplane-chat-write-')),activities=[]
+ const workspace=isolatedGitWorkspace('myplane-chat-write-'),activities=[]
  writeFileSync(path.join(workspace,'hello.txt'),'original\ncontext')
  try{
   const write={...capability('agent.write_file'),parameters:{type:'object',properties:{path:{type:'string'},content:{type:'string'}},required:['path','content']}}
@@ -886,7 +976,7 @@ test('repeated incomplete responses stop at a bounded continuation limit',async(
 })
 
 
-test('large tool results are compacted within budget while preserving goal and tool-call pairs',async()=>{
+test('large tool results use a bounded source projection without a model summary or broken tool pairs',async()=>{
   let executed=0, summaries=0; const states=[]
   await withModel((input)=>{
     if(input.messages[0].content.startsWith('仅压缩历史')){summaries++;return {content:'已搜索；返回天气资料，需要核实来源。'}}
@@ -894,7 +984,8 @@ test('large tool results are compacted within budget while preserving goal and t
   },async(connection,requests)=>{
     const original=[{role:'user',content:'查询成都天气，只使用官方来源'}]
     await runCoreChat({list:()=>[capability('agent.web_search')],execute:async()=>{executed++;return {success:true,output:'天气资料'.repeat(3000)}}},options(connection,{messages:original,onContext:state=>states.push(state)}))
-    assert.equal(executed,1);assert.ok(summaries>0);assert.ok(states.some(state=>state.state==='compacting'))
+    assert.equal(executed,1);assert.equal(summaries,0);assert.equal(states.at(-1).state,'ready')
+    assert.ok(requests.some(request=>request.messages.some(message=>message.role==='tool'&&JSON.parse(message.content).projection?.readWith==='runtime.read_evidence')))
     assert.deepEqual(original,[{role:'user',content:'查询成都天气，只使用官方来源'}])
     for(const request of requests){
       assert.ok(estimateTokens(request.messages)+estimateTokens(request.tools)+32+request.max_tokens<=connection.contextLength)
@@ -1181,9 +1272,9 @@ test('experience flow executes through normal chat permissions and reports actua
  }
 })
 test('conversation adopts verified file recipe before asking the model and preserves use evidence',async t=>{
- const workspace=mkdtempSync(path.join(tmpdir(),'experience-service-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+ const workspace=mkdtempSync(path.join(tmpdir(),'experience-service-')),track=workspaceCleanup(t,workspace)
  writeFileSync(path.join(workspace,'README.md'),'Current file evidence.')
- const service=new AgentCoreService({dataDir:path.join(workspace,'data'),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})});service.initialized=true
+ const service=track(new AgentCoreService({dataDir:path.join(workspace,'data'),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})}));service.initialized=true
  service.experiences.record('读取 README.md',workspace,['agent.read_file'],true)
  const entry=service.experienceState().entries[0]
  service.experiences.verify(entry.id,1,true,[],'通过');service.enableExperience(entry.id,1,true)
@@ -1200,8 +1291,8 @@ test('conversation adopts verified file recipe before asking the model and prese
 })
 
 test('conversation recovers failed recipe pages without learning duplicate or failed tool traces',async t=>{
- const workspace=mkdtempSync(path.join(tmpdir(),'experience-fallback-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
- const service=new AgentCoreService({dataDir:path.join(workspace,'data'),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})});service.initialized=true
+ const workspace=mkdtempSync(path.join(tmpdir(),'experience-fallback-')),track=workspaceCleanup(t,workspace)
+ const service=track(new AgentCoreService({dataDir:path.join(workspace,'data'),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})}));service.initialized=true
  service.experiences.record('搜索 Vue 文档',workspace,['agent.web_search','agent.web_fetch'],true)
  const entry=service.experienceState().entries[0]
  service.experiences.verify(entry.id,1,true,[],'通过');service.enableExperience(entry.id,1,true)
@@ -1220,9 +1311,9 @@ test('conversation recovers failed recipe pages without learning duplicate or fa
 
 
 test('recipe denial and cancellation preserve enabled status and use interruption counts',async t=>{
- const workspace=mkdtempSync(path.join(tmpdir(),'experience-interruption-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+ const workspace=mkdtempSync(path.join(tmpdir(),'experience-interruption-')),track=workspaceCleanup(t,workspace)
  for(const kind of ['denied','cancelled']){
-  const service=new AgentCoreService({dataDir:path.join(workspace,kind),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})});service.initialized=true
+  const service=track(new AgentCoreService({dataDir:path.join(workspace,kind),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})}));service.initialized=true
   service.experiences.record('搜索 Vue 文档',workspace,['agent.web_search','agent.web_fetch'],true)
   const entry=service.experienceState().entries[0];service.experiences.verify(entry.id,1,true,[],'ok');service.enableExperience(entry.id,1,true)
   const controller=new AbortController()
@@ -1237,8 +1328,8 @@ test('recipe denial and cancellation preserve enabled status and use interruptio
  }
 })
 test('chat reports recipe mismatch and retains a safe diagnostic for the library',async t=>{
- const workspace=mkdtempSync(path.join(tmpdir(),'experience-mismatch-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
- const service=new AgentCoreService({dataDir:workspace,skillsDir:path.join(workspace,'skills'),getConnection:()=>({})});service.initialized=true
+ const workspace=mkdtempSync(path.join(tmpdir(),'experience-mismatch-')),track=workspaceCleanup(t,workspace)
+ const service=track(new AgentCoreService({dataDir:workspace,skillsDir:path.join(workspace,'skills'),getConnection:()=>({})}));service.initialized=true
  service.experiences.record('搜索 Vue 文档',workspace,['agent.web_search','agent.web_fetch'],true)
  const entry=service.experienceState().entries[0],progress=[]
  await withModel(()=>({content:'需要可用的搜索工具。'}),async connection=>{
@@ -1249,9 +1340,9 @@ test('chat reports recipe mismatch and retains a safe diagnostic for the library
 })
 
 test('equivalent file requests reuse one certified recipe with unchanged permission gates',async t=>{
- const workspace=mkdtempSync(path.join(tmpdir(),'experience-phrases-'));t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+ const workspace=mkdtempSync(path.join(tmpdir(),'experience-phrases-')),track=workspaceCleanup(t,workspace)
  writeFileSync(path.join(workspace,'README.md'),'Current phrase evidence')
- const service=new AgentCoreService({dataDir:path.join(workspace,'data'),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})});service.initialized=true
+ const service=track(new AgentCoreService({dataDir:path.join(workspace,'data'),skillsDir:path.join(workspace,'skills'),getConnection:()=>({})}));service.initialized=true
  service.experiences.record('读取 README.md',workspace,['agent.read_file'],true)
  const entry=service.experienceState().entries[0]
  service.experiences.verify(entry.id,1,true,[],'ok');service.enableExperience(entry.id,1,true)

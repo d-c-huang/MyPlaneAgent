@@ -130,7 +130,7 @@ export class ExecutionRuntime {
         const error='工具报告成功，但文件内容未达到预期；请读取实际文件后修复：'+mismatchedFiles.join('、')
         result={...result,success:false,outcome:'failed',failureCode:'verification',error,output:{error,reportedOutput:result.output,mismatchedFiles}}
       }
-      if(signal.aborted)result={...result,success:false,outcome:'unknown',failureCode:signal.reason?.name==='TimeoutError'?'timeout':'cancelled',error:String(signal.reason)}
+      if(signal.aborted&&!result.admissionRejected)result={...result,success:false,outcome:'unknown',failureCode:signal.reason?.name==='TimeoutError'?'timeout':'cancelled',error:String(signal.reason)}
       const finishedVersion=isProcess?workspaceVersion(workspace):undefined
       const sourceChangedDuringExecution=isProcess&&sourceVersion!==finishedVersion
       if(result.success&&isProcess&&!effectful&&sourceChangedDuringExecution){
@@ -138,7 +138,7 @@ export class ExecutionRuntime {
         result={...result,success:false,outcome:'unknown',failureCode:'conflict',error,output:{...toolData(result.output),error}}
       }
       const filesUnchanged=!!operation.expectedFiles?.length&&versions.every(file=>file.hash!==null)&&sameVersions(versions,finishedFiles)
-      const mutated=!reused&&(effectful?!filesUnchanged:isProcess&&(!sourceVersion||sourceChangedDuringExecution))
+      const mutated=!result.admissionRejected&&!reused&&(effectful?!filesUnchanged:isProcess&&(!sourceVersion||sourceChangedDuringExecution))
       result={...result,metadata:{...result.metadata,runtime:capability.runtime,source:capability.source,evidenceId:operation.id,revision:operation.revision+(mutated?1:0),fileVersions:effectful?finishedFiles:versions,fileVersionsComplete:fileTargets(request.args).length<=40,parentEvidenceId:operation.parentEvidenceId,sourceVersion:sourceVersion===finishedVersion?sourceVersion:undefined,sourceChangedDuringExecution,filesChangedDuringExecution:!effectful&&!sameVersions(versions,finishedFiles),reusedFrom:reused?previous?.operation.id:undefined}}
       this.store?.finish(operation,result,mutated)
       signal.throwIfAborted()
