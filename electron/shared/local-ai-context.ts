@@ -17,7 +17,7 @@ export type ContextPinnedState={
  acceptance?:string[];
  unresolvedEffects?:Array<{id:string;capability?:string;status:'unknown'|'started';description?:string}>;
 }
-type CheckpointBody={source?:'model'|'recovery';summary:string;through:number;updatedAt:string;compactions:number;compaction?:ContextCompactionReport}
+type CheckpointBody={source?:'model'|'recovery'|'ledger';summary:string;through:number;updatedAt:string;compactions:number;compaction?:ContextCompactionReport}
 export type ContextCheckpoint=CheckpointBody&(
  | {version?:1;historyHash?:never;stateHash?:never;throughMessageId?:never;state?:never}
  | {version:2;historyHash:string;stateHash:string;throughMessageId?:string;state:ContextPinnedState}

@@ -3,8 +3,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import {projectModelHistory,toolResultContextBudget} from '../dist-electron/main/model-context-projection.js'
-import {contextMessages,contextStatus,estimateTokens,pinnedContext} from '../dist-electron/main/local-ai-context.js'
+import {projectModelHistory,toolResultContextBudget,toolPreviewContextBudget} from '../dist-electron/main/model-context-projection.js'
+import {contextMessages,contextStatus,estimateTokens,pinnedContext,compactContext,createContextCheckpoint,contextOccupancy} from '../dist-electron/main/local-ai-context.js'
 import {contextHistoryHash} from '../dist-electron/main/context-checkpoint.js'
 import {capabilityAlias} from '../dist-electron/main/agent/core/tool-surface.js'
 import {RuntimeStore} from '../dist-electron/main/agent/core/runtime-store.js'
@@ -34,10 +34,34 @@ test('wire budgets include JSON escaping, Unicode and status metadata at multipl
   // The capability itself is plain host metadata; unusual content is only output data.
   message.content=JSON.stringify({activityId:'unicode',capability:'agent.read_file',status:'error',notApplied:true,output:'头部😀"\n'.repeat(3000)+'尾部😀'})
   const projected=projectModelHistory([message],capacity)[0],row=JSON.parse(projected.content)
-  assert.ok(estimateTokens(projected.content)<=toolResultContextBudget(capacity))
+  assert.ok(estimateTokens(projected.content)<=toolPreviewContextBudget(capacity))
   assert.equal(row.status,'error');assert.equal(row.notApplied,true)
   assert.doesNotMatch(projected.content,/\\u[dD][89abAB][0-9a-fA-F]{2}(?!\\u[dD][cdefCDEF])/)
  }
+})
+
+test('preview budgets leave room for the next tool group without reducing continuous readback budgets',()=>{
+ assert.equal(toolPreviewContextBudget(8192),491)
+ assert.equal(toolResultContextBudget(8192),983)
+ assert.equal(toolPreviewContextBudget(4096),256)
+ assert.equal(toolPreviewContextBudget(131072),2048)
+})
+
+test('small preview savings defer optional summaries while forced compaction still reads the full source',async()=>{
+ const history=[{role:'user',content:'核对 head 和 tail 的原始值'}, {role:'assistant',content:'已经归档的进度'},calls(),reply(),{role:'assistant',content:'准备核对结果。'},{role:'assistant',content:'继续核对要求。'}]
+ const checkpoint=createContextCheckpoint(history,2,'之前的进度已归档'),budget={contextLength:8192,maxTokens:1024}
+ const system=[{role:'system',content:''}]
+ while(contextOccupancy(contextStatus(history,system,checkpoint,budget))<8192*.85)system[0].content+='固定说明 '.repeat(10)
+ const source=structuredClone(history)
+ let summaries=0
+ const summarySources=[]
+ const options={history,system,checkpoint,budget,signal:new AbortController().signal,summarize:async messages=>{summaries++;summarySources.push(JSON.stringify(messages));return '原始 head、tail 已取得，尚需核对。'}}
+ assert.equal(await compactContext(options),checkpoint)
+ assert.equal(summaries,0,'a small input saving does not justify a full-source summary call')
+ const forced=await compactContext({...options,force:true})
+ assert.ok(forced.through>checkpoint.through);assert.ok(summaries>0)
+ assert.match(summarySources.join('\n'),/MIDDLE-ORIGINAL-ONLY/)
+ assert.deepEqual(history,source)
 })
 
 test('readback pages, unstructured legacy output and short results are preserved losslessly',()=>{

@@ -4,6 +4,9 @@ import {capabilityAlias} from './agent/core/tool-surface.js'
 
 const cache=new WeakMap<ContextMessage,{source:string;capacity:number;content:string}>()
 export const toolResultContextBudget=(capacity:number)=>Math.max(256,Math.min(2048,Math.floor(capacity*.12)))
+// Previews share the working window with calls, replies and mandatory host state.
+// Continuous readback pages keep the larger budget above and are never excerpted again.
+export const toolPreviewContextBudget=(capacity:number)=>Math.min(toolResultContextBudget(capacity),Math.max(256,Math.floor(capacity*.06)))
 const readers=new Set(['runtime.read_history','runtime.read_evidence'])
 
 /** Pure view: preserve originals, statuses, call pairing and evidence IDs; never summarize with a model. */
@@ -13,7 +16,7 @@ function projectResult(message:ContextMessage,capacity:number):ContextMessage{
  if(cached?.source===message.content&&cached.capacity===capacity)return cached.content===message.content?message:{...message,content:cached.content}
  let content=message.content
  try{
-  const row=JSON.parse(content),limit=toolResultContextBudget(capacity)
+  const row=JSON.parse(content),limit=toolPreviewContextBudget(capacity)
   // Only host result envelopes are projected. Readback pages must remain lossless.
   if(typeof row.activityId==='string'&&typeof row.capability==='string'&&['complete','error','denied'].includes(row.status)&&
    typeof row.output==='string'&&!readers.has(row.capability)&&estimateTokens(content)>limit){

@@ -595,6 +595,36 @@ test('withdrawn research providers refresh browser facts and do not force a stal
  assert.equal(calls,2,'a removed provider cannot trigger a correction claiming it is still available')
 })
 
+test('an unapplied provider change gets one bounded correction without bypassing the new approval',async()=>{
+ const registry=new CapabilityRegistry({getAllTools:()=>[]}),old={...capability('agent.read_file','read'),runtime:'builtin'}
+ let requests=0,calls=0,approvals=0,outcome,refused=false
+ registry.registerBuiltin(old,async()=>assert.fail('old provider must not run'))
+ await withModel(input=>{
+  if(!refused&&input.messages.some(row=>row.role==='tool'&&String(row.content).includes('tool-admission-changed'))){refused=true;return {content:'工具定义变化，无法继续，请用户确认是否重试。'}}
+  if(calls)return {content:'已取得更新后的实际结果。'}
+  return toolCall(input,'agent.read_file',{query:'new'})
+ },async connection=>{
+  await runCoreChat(registry,options(connection,{filesEnabled:true,onRequest:()=>{if(++requests===1)registry.registerBuiltin({...old,tags:['requires-approval','risk:read']},async()=>{calls++;return 'actual result'})},approve:async()=>{approvals++;return true},onOutcome:value=>outcome=value}))
+ })
+ assert.equal(refused,true);assert.equal(calls,1);assert.equal(approvals,1);assert.equal(outcome,'complete')
+})
+
+test('unapplied-provider correction does not insist on an old step after alternative tools made progress',async()=>{
+ const registry=new CapabilityRegistry({getAllTools:()=>[]}),old={...capability('agent.read_file','read'),runtime:'builtin'}
+ let requests=0,normalTurns=0,alternatives=0,oldStepCalls=0
+ registry.registerBuiltin(old,async()=>assert.fail('old provider must not run'))
+ registry.registerBuiltin({...capability('agent.read_files','read'),runtime:'builtin'},async()=>{alternatives++;return 'the requested original contents'})
+ await withModel(input=>{
+  if(++normalTurns===1)return toolCall(input,'agent.read_file',{query:'read target'})
+  if(!alternatives)return toolCall(input,'agent.read_files',{query:'read same target'})
+  return {content:'已通过替代读取取得原文。'}
+ },async(connection,bodies)=>{
+  await runCoreChat(registry,options(connection,{filesEnabled:true,onRequest:()=>{if(++requests===1)registry.registerBuiltin({...old},async()=>{oldStepCalls++;return 'redundant'})}}))
+  assert.ok(bodies.every(body=>!body.messages.some(row=>String(row.content).includes('此纠正只进行一次'))))
+ })
+ assert.equal(normalTurns,3);assert.equal(alternatives,1);assert.equal(oldStepCalls,0)
+})
+
 test('chat discards truncated tool calls and recovers with bounded output without executing partial work',async()=>{
  const executions=[], progress=[];let count=0,usage=0
  await withModel((input,n)=>n===1?{...toolCall(input,'agent.web_search',{query:'truncated'}),finish_reason:'length'}:n===2?toolCall(input,'agent.web_search',{query:'complete'}):{content:'已有完整查询结果'},async(connection,requests)=>{

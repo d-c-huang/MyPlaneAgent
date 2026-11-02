@@ -9,6 +9,8 @@ import {requestAgentModel} from '../dist-electron/main/agent/model.js'
 import {contextHistoryHash} from '../dist-electron/main/context-checkpoint.js'
 import {pinnedContext,createContextCheckpoint,contextMessages,allocateContextBudget} from '../dist-electron/main/local-ai-context.js'
 import {isolatedGitWorkspace} from '../tests/helpers/workspace.mjs'
+import {recordAuditUsage,phaseMetrics,combinedMetrics,auditPassed} from './lib/live-audit-metrics.mjs'
+import {estimateTokens} from '../dist-electron/main/context-token-estimate.js'
 
 const entry=fileURLToPath(import.meta.url),mode=process.argv[2]||'all'
 const phasesAllowed=new Set(['interrupt','resume','history'])
@@ -62,19 +64,23 @@ function register(core){
 async function child(phase){
  const prior=fs.existsSync(path.join(output,phase+'.json'))?read(phase+'.json'):undefined
  if(prior)save(phase+'-attempt-'+(prior.attempt||1)+'.json',prior)
- const report={phase,model,capacity,pid:process.pid,attempt:(prior?.attempt||0)+1,previousRequests:(prior?.previousRequests||0)+(prior?.requests||0),requests:0,usages:[],activities:[],compactions:[],answer:'',outcome:null,startedAt:new Date().toISOString()}
+ const report={phase,model,capacity,pid:process.pid,attempt:(prior?.attempt||0)+1,previousRequests:(prior?.previousRequests||0)+(prior?.requests||0),requests:0,usages:[],requestUsages:{},wireRequests:[],activities:[],compactions:[],answer:'',outcome:null,startedAt:new Date().toISOString()}
  const seen=new Set(),controller=new AbortController(),realFetch=globalThis.fetch,captures=[]
  let traceIndex=0
  globalThis.fetch=async(url,init)=>{
-  let index
+  let index,wire
   if(String(url).endsWith('/chat/completions')&&init?.body){
    index=++traceIndex
    const body=JSON.parse(init.body)
+   const kind=String(body.messages[0]?.content).startsWith('仅压缩历史')?'summary':body.messages.some(row=>row.role==='system'&&String(row.content).includes('你是任务完成检查器'))?'review':'task'
+   wire={index,request:report.requests,kind,startedAt:new Date().toISOString(),estimatedInputTokens:estimateTokens(body.messages)+estimateTokens(body.tools)+32,maxTokens:body.max_tokens}
+   report.wireRequests.push(wire)
    fs.appendFileSync(path.join(output,phase+'-requests.jsonl'),JSON.stringify({model:body.model,max_tokens:body.max_tokens,messages:body.messages,tools:body.tools})+'\n')
    report.restoredPromptSeen||=body.messages.some(row=>row.role==='system'&&String(row.content).includes('已恢复本 Worker'))
   }
-  const response=await realFetch(url,init)
-  if(index!==undefined)captures.push(response.clone().text().then(body=>fs.appendFileSync(path.join(output,phase+'-responses.jsonl'),JSON.stringify({attempt:report.attempt,index,status:response.status,body:clean(body)})+'\n')).catch(()=>{}))
+  let response
+  try{response=await realFetch(url,init)}catch(error){if(wire)Object.assign(wire,{finishedAt:new Date().toISOString(),error:clean(error.message)});throw error}
+  if(index!==undefined)captures.push(response.clone().text().then(body=>{Object.assign(wire,{finishedAt:new Date().toISOString(),status:response.status});fs.appendFileSync(path.join(output,phase+'-responses.jsonl'),JSON.stringify({attempt:report.attempt,index,status:response.status,body:clean(body)})+'\n')}).catch(error=>{Object.assign(wire,{finishedAt:new Date().toISOString(),error:clean(error.message)})}))
   return response
  }
  const core=new AgentCoreService({dataDir:path.join(output,'agent-data'),skillsDir:path.join(output,'skills'),getConnection:()=>connection})
@@ -93,7 +99,7 @@ async function child(phase){
   await core.runConversation(options([{role:'user',content:prompt}],{
    ...(phase==='history'?{executionContext:{taskId:scope.taskId,workspace},filesEnabled:false}:{}),
    signal:AbortSignal.any([controller.signal,AbortSignal.timeout(timeLimit)]),
-   onRequest:()=>{report.requests++;save(phase+'.json',report)},onUsage:usage=>{report.usages.push(usage)},
+   onRequest:()=>{report.requests++;save(phase+'.json',report)},onUsage:usage=>{report.usages.push(usage);recordAuditUsage(report,report.requests,usage)},
    onContent:text=>{report.answer+=text},onOutcome:outcome=>{report.outcome=outcome},
    onContext:status=>{const metric=status.lastCompaction;if(metric&&metric.startedAt>=report.startedAt&&!seen.has(metric.startedAt)){seen.add(metric.startedAt);report.compactions.push(metric);log({phase,compaction:metric.outcome,before:metric.beforeInputTokens,after:metric.afterInputTokens,calls:metric.requests})}},
    onActivity:activity=>{
@@ -111,7 +117,7 @@ async function child(phase){
   await core.dispose();globalThis.fetch=realFetch
   await Promise.allSettled(captures)
  }
- report.finishedAt=new Date().toISOString();save(phase+'.json',report)
+ report.finishedAt=new Date().toISOString();report.metrics=phaseMetrics(report);save(phase+'.json',report)
  log({phase,outcome:report.outcome,error:report.error,requests:report.requests,compactions:report.after?.compactions})
 }
 async function runChild(phase){
@@ -151,14 +157,16 @@ else{
    report.checks={...report.checks,multipleCompactions:(b.after?.compactions||0)>=3,separateProcesses:a.pid!==b.pid,recoveredSameGeneration:a.after?.generation===b.after?.generation,recoveredExactHistory:a.after?.historyHash===(b.initialBefore||b.before)?.historyHash,everyResumeMatchesPriorSnapshot:b.recoveryChainMatch!==false,restoredPromptSeen:b.restoredPromptSeen===true,allBatchesActuallyRead:f.batches.every(row=>state.reads.includes(row.path)),allCodesReported:f.batches.every(row=>b.answer.includes(row.code)),writeExecutedOnce:state.writes===1,completed:b.outcome==='complete',noRunError:!b.failed}
    const batchReads=state.reads.filter(file=>f.batches.some(row=>row.path===file))
    report.longTask={firstRequests:a.requests,resumedRequests:b.requests+(b.previousRequests||0),resumeAttempts:b.attempt||1,compactions:b.after?.compactions,reads:state.reads,redundantBatchReads:batchReads.length-new Set(batchReads).size,writes:state.writes}
+   const attempts=Array.from({length:(b.attempt||1)-1},(_,i)=>read('resume-attempt-'+(i+1)+'.json'))
+   report.longTask.metrics=combinedMetrics([a,...attempts,b])
   }
   if(fs.existsSync(path.join(output,'history.json'))){
    const h=read('history.json'),f=read('fixture.json'),pages=h.activities.filter(row=>row.capability==='runtime.read_history'&&row.status==='complete')
-   report.checks={...report.checks,historyRetrievedExactTicket:h.answer.includes(f.secret),historyPaged:pages.length>=2,historyUsedActualTool:pages.length>0,historyNoRunError:!h.failed}
-   report.history={requests:h.requests,pages:pages.length,answer:h.answer,error:h.error}
+   report.checks={...report.checks,historyRetrievedExactTicket:h.answer.includes(f.secret),historyPaged:pages.length>=2,historyUsedActualTool:pages.length>0,historyCompleted:h.outcome==='complete',historyNoRunError:!h.failed}
+   report.history={requests:h.requests,pages:pages.length,answer:h.answer,error:h.error,metrics:phaseMetrics(h)}
   }
   if(fs.existsSync(path.join(output,'source-facts.json'))){const facts=read('source-facts.json');report.checks.sourceOverridesIncorrectSummary=facts.allExactCodes&&facts.noFileReplay;report.sourceFacts={allExactCodes:facts.allExactCodes,noFileReplay:facts.noFileReplay}}
-  report.passed=Object.values(report.checks).every(Boolean);save('report.json',report);log(report)
+  report.passed=auditPassed(report.checks);save('report.json',report);log(report)
   if(!report.passed)process.exitCode=1
  }
 }

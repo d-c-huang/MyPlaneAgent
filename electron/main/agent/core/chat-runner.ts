@@ -351,6 +351,7 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
     pause(reason + (review ? `\n最近检查：${review.reason}\n待处理步骤：${review.nextStep || '检查器未提供具体步骤'}` : ''))
   }
   let toolSurfaceNotice:AgentMessage|undefined
+  const unappliedTools=new Map<string,number>(),correctedUnappliedTools=new Set<string>()
   for (let round = 0; ; round++) {
     options.signal.throwIfAborted()
     if (round >= roundLimit) {
@@ -371,7 +372,7 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
       if(!webCapabilityReminder&&system.includes(webContextMessage))system.splice(system.indexOf(webContextMessage),1)
       else if(webCapabilityReminder&&!system.includes(webContextMessage))system.push(webContextMessage)
       if(toolSurfaceNotice)system.splice(system.indexOf(toolSurfaceNotice),1)
-      toolSurfaceNotice={role:'system',content:'工具提供者或定义已更新。本轮只使用当前 tools；此前关于可用工具的描述不再适用。未执行的旧调用不能视为已完成，需要时按新定义重新生成参数。'}
+      toolSurfaceNotice={role:'system',content:'工具提供者或定义已更新。本轮只使用当前 tools；此前关于可用工具的描述不再适用。tool-admission-changed / notApplied 表示宿主确认旧调用没有执行，不是用户拒绝或未知副作用。若当前 tools 仍有同名能力，继续尚未完成的目标，依据新 Schema 重新生成参数；需要的新审批由宿主按当前权限处理，无需用户重新发送任务。若当前权限已收回该能力，则如实说明限制。'}
       system.push(toolSurfaceNotice)
     }
     const phaseTools=reviewQueue.phase==='implement'&&reviewQueue.implementationRecovery?tools.filter(tool=>{const name=aliases.get(tool.function.name)?.name||'';return !browserCapabilityNames.has(name)&&!previewCapabilityNames.has(name)}):tools
@@ -468,6 +469,14 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
     saveContext()
     if (!response.tool_calls?.length) {
       if (denied) { options.onOutcome?.('blocked'); options.onContent(candidate || '操作已被拒绝，已停止执行。'); return }
+      const retryable=synthesizeFromEvidence?[]:[...unappliedTools].filter(([name,progress])=>progress===succeeded&&!correctedUnappliedTools.has(name)&&capabilities.some(cap=>cap.name===name)&&turnTools.some(tool=>aliases.get(tool.function.name)?.name===name)).map(([name])=>name)
+      if(retryable.length){
+        retryable.forEach(name=>correctedUnappliedTools.add(name))
+        history.pop();saveContext()
+        system.push({role:'system',content:'旧调用仅因工具更新而未执行，宿主确认没有副作用。以下能力当前仍可用：'+retryable.join('、')+'。原目标尚未完成，请按当前 tools 的 Schema 生成下一步调用，不把这次接纳拒绝当作任务最终失败，也不要求用户再次确认是否继续。审批仍由宿主按当前规则处理；若缺少无法推断的必要参数，可说明具体缺口。此纠正只进行一次，不得循环重试。'})
+        options.onProgress?.('工具定义已刷新，正在按当前参数继续未执行的步骤','working')
+        continue
+      }
       const researchRequest=options.messages.filter(m=>m.role==='user').some(m=>typeof m.content==='string'&&/(天气|预报|联网|查询|查找|https?:\/\/|www\.)/.test(m.content))
       const handoff=/(?:建议|请|可以|可自行)[\s\S]{0,100}(?:访问|打开|查看|查询)[\s\S]{0,120}(?:网站|官网|天气网|https?:\/\/|www\.)/.test(candidate)
       if(researchAvailable&&researchRequest&&handoff&&!pageReadAttempted&&!correctedResearchHandoff){
@@ -749,6 +758,8 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
         }else result=await execute()
         result=result!
         admissionRejected=result.admissionRejected===true
+        if(admissionRejected)unappliedTools.set(capability.name,succeeded)
+        else unappliedTools.delete(capability.name)
         if(!admissionRejected){
           if(capability.name==='agent.web_search')searchAttempted=true
           if(capability.name==='agent.web_fetch'||capability.source.type==='builtin'&&browserReaders.has(capability.name))pageReadAttempted=true

@@ -1,6 +1,7 @@
 import {estimateTokens} from './context-token-estimate.js'
 export {estimateTokens} from './context-token-estimate.js'
 import {projectModelHistory} from './model-context-projection.js'
+import {toolLedgerSummary} from './context-tool-ledger.js'
 import type {ContextCheckpoint,ContextStatus,ContextPinnedState,ContextCompactionReport} from '../shared/local-ai-context.js'
 import {mergeTokenUsage,sumTokenUsage,type TokenUsage} from '../shared/local-ai-usage.js'
 import {ModelOutputLimitError} from './local-ai-model-error.js'
@@ -209,7 +210,20 @@ async function compactContextImpl(options:CompactContextOptions):Promise<Context
  const minimum=contextStatus(history,system,createContextCheckpoint(history,through,'',previous,budget.pinned),budget)
  if(contextOccupancy(minimum)>budget.contextLength)throw new Error('必保留的用户要求、权限、验收条件或工具定义超出上下文容量。请缩短最新要求或增大上下文容量；原始记录与原检查点已保留，无法安全恢复。')
  // Do not spend a model call archiving a tiny prefix that cannot offset the checkpoint envelope.
- if(!options.force&&contextOccupancy(before)<=budget.contextLength&&minimum.inputTokens+Math.min(128,summaryTarget)>=before.inputTokens)return previous
+ const recent=history.slice(from),projected=projectModelHistory(recent,budget.contextLength)
+ const hasToolPreviews=projected.some((message,index)=>message.role==='tool'&&message.content!==recent[index].content)
+ // Re-summarizing a preview's full source to save a few hundred input tokens
+ // can cost more than retaining that already bounded view for the next step.
+ const minimumSaving=hasToolPreviews?Math.max(256,Math.floor(budget.contextLength*.15)):Math.min(128,summaryTarget)
+ if(!options.force&&contextOccupancy(before)<=budget.contextLength&&minimum.inputTokens+minimumSaving>=before.inputTokens)return previous
+ if(!options.force&&hasToolPreviews){
+  const ledger=toolLedgerSummary(history,through)
+  if(ledger){
+   unchanged()
+   const checkpoint=createContextCheckpoint(history,through,ledger,previous,budget.pinned,'ledger'),after=contextStatus(history,system,checkpoint,budget)
+   if(contextOccupancy(after)<=budget.contextLength&&after.inputTokens<before.inputTokens)return checkpoint
+  }
+ }
  let summary=previous?.summary||'',remaining=summaryText(history.slice(from,through),from),rounds=0
  while(remaining){
   signal.throwIfAborted()

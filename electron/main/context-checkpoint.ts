@@ -60,14 +60,14 @@ export function validateCheckpoint(history:ContextMessage[],checkpoint?:ContextC
  if(!Number.isInteger(checkpoint.through)||checkpoint.through<0||checkpoint.through>history.length||typeof checkpoint.summary!=='string'||history[checkpoint.through]?.role==='tool')return mismatch()
  if(checkpoint.version!==undefined&&checkpoint.version!==1&&checkpoint.version!==2)return mismatch()
  if(checkpoint.version===2){
-  if(!completeContextBoundary(history,checkpoint.through)||checkpoint.historyHash!==contextHistoryHash(history,checkpoint.through)||!validPinnedState(checkpoint.state)||checkpoint.stateHash!==stateHash(checkpoint.state)||!Number.isSafeInteger(checkpoint.compactions)||checkpoint.compactions<0||typeof checkpoint.updatedAt!=='string'||!['model','recovery'].includes(checkpoint.source||''))return mismatch()
+  if(!completeContextBoundary(history,checkpoint.through)||checkpoint.historyHash!==contextHistoryHash(history,checkpoint.through)||!validPinnedState(checkpoint.state)||checkpoint.stateHash!==stateHash(checkpoint.state)||!Number.isSafeInteger(checkpoint.compactions)||checkpoint.compactions<0||typeof checkpoint.updatedAt!=='string'||!['model','recovery','ledger'].includes(checkpoint.source||''))return mismatch()
   if(checkpoint.throughMessageId!==undefined&&checkpoint.throughMessageId!==history[checkpoint.through-1]?.id)return mismatch()
   if(state&&(checkpoint.state.taskId!==state.taskId||checkpoint.state.workerId!==state.workerId))return mismatch()
  }
  return checkpoint
 }
 
-export function createContextCheckpoint(history:ContextMessage[],through:number,summary:string,previous?:ContextCheckpoint,state?:ContextPinnedState,source:'model'|'recovery'='model'):ContextCheckpoint {
+export function createContextCheckpoint(history:ContextMessage[],through:number,summary:string,previous?:ContextCheckpoint,state?:ContextPinnedState,source:'model'|'recovery'|'ledger'='model'):ContextCheckpoint {
  if(!completeContextBoundary(history,through))throw new Error('工具调用尚未完成，不能压缩或重建上下文。')
  const snapshot=pinnedContext(history,state)
  return {version:2,source,summary,through,historyHash:contextHistoryHash(history,through),
