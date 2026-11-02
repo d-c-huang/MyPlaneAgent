@@ -225,6 +225,7 @@ export async function runCoreChat(registry: CapabilityRegistry, options: ChatRun
     {itemId:context.itemId,goal:options.taskScope?.goal||initialPinned.goal,kind:options.currentStep?.kind,title:options.currentStep?.title,acceptance:options.currentStep?.acceptance,mode:options.workerMode,writeScopes:context.writeScopes},history,initialPinned):undefined
   if(durable){history=durable.history as AgentMessage[];checkpoint=durable.checkpoint;initialPinned={...initialPinned,requirements:durable.requirements}}
   let lastCompaction:ContextCompactionReport|undefined=durable?.lastCompaction??checkpoint?.compaction
+  const recovery=durable?.recovery
   const pendingEffects=new Map([...(initialPinned.unresolvedEffects||[]),...(durable?.effects||[])].map(effect=>[effect.id,effect]))
   let completed=false
   const emitOutcome=options.onOutcome
@@ -263,7 +264,7 @@ export async function runCoreChat(registry: CapabilityRegistry, options: ChatRun
       gitDirty=false
     }
     if (!canDefer && needsCompaction(before,compactPolicy?.triggerRatio))
-      options.onContext?.({ ...before, state: 'compacting' })
+      options.onContext?.({ ...before, state: 'compacting',recovery,origin:'worker',model:options.model })
     const previousCheckpoint = checkpoint
     try{
     if (!canDefer) checkpoint = await compactContext({ history, system, checkpoint, budget, signal: options.signal, evidence:gitEvidence, triggerRatio:compactPolicy?.triggerRatio, retainRecent:compactPolicy?.retainRecent,
@@ -275,7 +276,7 @@ export async function runCoreChat(registry: CapabilityRegistry, options: ChatRun
         return answer.content || ''
       }
     })
-    }catch(error){options.onContext?.({...before,state:'error',message:options.signal.aborted?'压缩已停止，原记录已保留':String(error),lastCompaction});throw error}
+    }catch(error){options.onContext?.({...before,state:'error',message:options.signal.aborted?'压缩已停止，原记录已保留':String(error),lastCompaction,recovery,origin:'worker',model:options.model});throw error}
     saveContext()
     if (!canDefer) deferOptionalCompaction = checkpoint === previousCheckpoint && needsCompaction(before,compactPolicy?.triggerRatio)&&!inCompactionGrowthWindow(before,previousCheckpoint)
     const contextualSystem=systemWithGitContext(history,system,checkpoint,budget,gitEvidence)
@@ -283,7 +284,7 @@ export async function runCoreChat(registry: CapabilityRegistry, options: ChatRun
     const restoreScreenshot=screenshotMessage&&!prepared.includes(screenshotMessage)
     const status = contextStatus(history, contextualSystem, checkpoint, restoreScreenshot?{...budget,overhead:[overhead,screenshotMessage]}:budget)
     assertContextFits(status)
-    options.onContext?.({...status,lastCompaction,triggerRatio:compactPolicy?.triggerRatio??status.triggerRatio})
+    options.onContext?.({...status,lastCompaction,triggerRatio:compactPolicy?.triggerRatio??status.triggerRatio,recovery,origin:'worker',model:options.model})
     if(restoreScreenshot)prepared.push(screenshotMessage!)
     return prepared
   }
@@ -758,6 +759,7 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
         }else result=await execute()
         result=result!
         admissionRejected=result.admissionRejected===true
+        if(admissionRejected)activity.notApplied=true
         if(admissionRejected)unappliedTools.set(capability.name,succeeded)
         else unappliedTools.delete(capability.name)
         if(!admissionRejected){

@@ -4,7 +4,7 @@ const labels:Record<string,string>={web_search:'搜索网页',web_fetch:'读取�
 export function toolLabel(activity:StudioToolActivity){const name=activity.capability.split('.').at(-1)||activity.capability;return labels[name]||activity.capability}
 export function toolTarget(activity:StudioToolActivity){for(const key of ['command','query','path','url','script','action'])if(typeof activity.args[key]==='string')return activity.args[key] as string;if(Array.isArray(activity.args.changes))return activity.args.changes.map(change=>change&&typeof change.path==='string'?change.path:'').filter(Boolean).join('、');return ''}
 export function toolOutput(activity:StudioToolActivity):Record<string,unknown>|undefined{try{const value=JSON.parse(activity.output||'');return value&&typeof value==='object'&&!Array.isArray(value)?value:undefined}catch{return}}
-export function toolState(activity:StudioToolActivity){const result=toolOutput(activity);return activity.status==='complete'&&typeof result?.exitCode==='number'&&result.exitCode!==0?'error':activity.status}
+export function toolState(activity:StudioToolActivity){if(activity.notApplied===true&&activity.status==='error')return 'unapplied';const result=toolOutput(activity);return activity.status==='complete'&&typeof result?.exitCode==='number'&&result.exitCode!==0?'error':activity.status}
 export function chatArtifacts(messages:StudioMessage[]):ChatArtifact[]{
  const artifacts=new Map<string,ChatArtifact>()
  for(const message of messages)for(const activity of message.toolActivity||[]){

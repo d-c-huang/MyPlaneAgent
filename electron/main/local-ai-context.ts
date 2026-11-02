@@ -144,6 +144,7 @@ export async function compactContext(options:CompactContextOptions):Promise<Cont
   ...(before?{beforeInputTokens:before.inputTokens,reservedOutput:before.reservedOutput,safetyTokens:before.safetyTokens}:{}),
   ...(after?{afterInputTokens:after.inputTokens,savedInputTokens:Math.max(0,(before?.inputTokens??after.inputTokens)-after.inputTokens)}:{}),
   usage:sumTokenUsage(usages),
+  ...((outcome==='compressed'||outcome==='recovered')&&result?.source?{method:result.source}:{}),
   ...((outcome==='compressed'||outcome==='recovered')&&result?.version===2?{quality:{requirements:result.state.requirements.length,unresolvedEffects:result.state.unresolvedEffects?.length||0,completeToolBoundary:true as const,historyUnchanged:true as const}}:{}),
  })
  let finalReport:ContextCompactionReport|undefined

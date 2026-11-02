@@ -1533,10 +1533,11 @@ export class LocalAiStudioService extends LocalAiService {
         this.saveSession(session);
       }
     }
+    const interruptedCompaction=session.context?.state==='compacting'&&![...this.chats.values()].some(run=>run.sessionId===session.id)
     session.context = {
       ...this.chatContextStatus(session),
-      state: session.context?.state || "ready",
-      message: session.context?.message,
+      state: interruptedCompaction?'error':session.context?.state || "ready",
+      message: interruptedCompaction?'上次上下文整理未完成，原始记录已保留。可以继续对话或重新整理。':session.context?.message,
     };
     return session;
   }
@@ -1752,12 +1753,15 @@ export class LocalAiStudioService extends LocalAiService {
     session: StudioSession,
     settings = this.inferenceSettings(session.model),
   ) {
+    // A worker's view includes its own tool schemas and checkpoint. Recounting the
+    // coordinator's chat is a different input and must not overwrite that last observation.
+    if(session.context?.origin==='worker'&&session.context.model===session.model&&session.context.capacity===settings.contextLength)return {...session.context,state:'ready' as const}
     return {...contextStatus(
       this.chatHistory(session),
       this.chatSystem(session),
       session.checkpoint,
       {...settings,pinned:sessionContextState(session,this.chatHistory(session),this.agent.projects().find(project=>project.id===session.projectId)?.workspace)},
-    ),...(session.context?.lastCompaction?{lastCompaction:session.context.lastCompaction}:{})};
+    ),...(session.context?.lastCompaction?{lastCompaction:session.context.lastCompaction}:{}),...(session.context?.recovery?{recovery:session.context.recovery}:{})};
   }
   private async prepareChatContext(
     session: StudioSession,
@@ -2035,6 +2039,7 @@ export class LocalAiStudioService extends LocalAiService {
       const core = await this.ensureAgentCore();
       const previousByWorker=new Map<string,TokenUsage|undefined>();
       const answerTotals = emptyTokenUsageTotals();
+      answer.usageTotals = answerTotals;
       session.messages.push(answer);
       const progress = (text:string, phase:'working'|'reviewing'|'context') => {
         answer.execution ??= [];
@@ -2065,7 +2070,7 @@ export class LocalAiStudioService extends LocalAiService {
         onProgress: progress,
         onOutcome: outcome => { answer.outcome = outcome; emit({type:'outcome',requestId,outcome}); },
         onContext: context => { if(context.state==='compacting')progress('正在整理上下文，保留任务要求与执行记录','context'); session.context = context; emit({type:'context',requestId,context}); },
-        onRequest: workerId => { previousByWorker.set(workerId||'main',undefined); session.usage!.requests++; },
+        onRequest: workerId => { previousByWorker.set(workerId||'main',undefined); session.usage!.requests++; answerTotals.requests++; },
         onContent: content => {
           answer.content += content;
           if (answer.content.length + (answer.reasoning?.length || 0) > responseCharacterLimit) throw new Error('输出已达到应用单轮容量');

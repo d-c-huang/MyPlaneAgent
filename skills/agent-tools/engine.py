@@ -369,7 +369,7 @@ def execute_plan(root,plan):
             with tempfile.NamedTemporaryFile(dir=file.parent,delete=False) as tmp: tmp.write(data);name=tmp.name
             os.chmod(name,mode)
             for attempt in range(3):
-                resolve(root,str(file.relative_to(root)),True)
+                resolve(root,file.relative_to(root).as_posix(),True)
                 current=file.read_bytes() if file.exists() else None
                 if current!=original: raise ValueError('重试前发现文件已变化，停止替换：'+str(file))
                 try:

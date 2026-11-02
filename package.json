@@ -24,7 +24,8 @@
     "test": "npm run build:electron && node --test tests/*.test.mjs",
     "test:history": "npm run build:electron && electron tests/local-ai-history-recovery.electron.mjs",
     "test:abilities": "npm run build:app && electron tests/ability-modules.electron.mjs",
-    "test:smoke": "npm run build:app && electron tests/agent-core-standalone.electron.mjs"
+    "test:smoke": "npm run build:app && electron tests/agent-core-standalone.electron.mjs",
+    "test:conversation": "npm run build:app && electron tests/conversation-workspace.electron.mjs"
   },
   "dependencies": {
     "@codemirror/commands": "^6.11.1",

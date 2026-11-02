@@ -45,6 +45,7 @@ test('automatic projected-tool compaction produces a durable source-backed check
  let calls=0
  const checkpoint=await compactContext({history,system,checkpoint:previous,budget,signal:new AbortController().signal,summarize:async()=>{calls++;return '不应请求模型'}})
  assert.equal(checkpoint.source,'ledger');assert.equal(calls,0);assert.equal(checkpoint.compaction.requests,0)
+ assert.equal(checkpoint.compaction.method,'ledger')
  assert.equal(checkpoint.compaction.outcome,'compressed');assert.equal(validateCheckpoint(history,checkpoint,pinned),checkpoint)
  assert.equal(contextHistoryHash(history,history.length),hash)
  assert.match(contextMessages(history,system,checkpoint,pinned,8192).map(row=>row.content).join('\n'),/B1-exact/)

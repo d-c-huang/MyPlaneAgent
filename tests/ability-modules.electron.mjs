@@ -1,4 +1,4 @@
-import {app,BrowserWindow} from 'electron'
+import {app,BrowserWindow,ipcMain} from 'electron'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -41,13 +41,14 @@ async function main(){try{
     let body='';for await(const part of request)body+=part
     const value=JSON.parse(body);requests.push(value)
     const text=JSON.stringify(value.messages)
-    const content=text.includes('能力模块维护程序')?JSON.stringify({cause:'module',diagnosis:'扩展继续任务的常用表达',code:fixedCode}):text.includes('你是任务完成检查器')?JSON.stringify({status:'complete',reason:'已回答',nextStep:''}):'收到，已保留对话目标。'
+    const content=text.includes('能力模块维护程序')?JSON.stringify({cause:'module',diagnosis:'扩展继续任务的常用表达',code:fixedCode}):text.includes('现在仅规划当前用户任务')?JSON.stringify({steps:[{key:'answer',title:'整理目标和约束',acceptance:'回答保留原文件约束',kind:'answer',dependsOn:[]}]}):text.includes('你是任务完成检查器')?JSON.stringify({status:'complete',reason:'已回答',nextStep:''}):'收到，已保留对话目标。'
     response.end(JSON.stringify({choices:[{finish_reason:'stop',message:{role:'assistant',content}}],usage:{prompt_tokens:100,completion_tokens:20}}))
   })
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve))
   service=new LocalAiStudioService(path.join(root,'data'))
   service.saveStudioSettings({source:'external',endpoint:`http://127.0.0.1:${server.address().port}/v1`,model:'fixture-model',contextLength:32768,maxTokens:4096})
   registerLocalAiStudio(()=>service,()=>service.dispose())
+  for(const channel of ['performance:window','inspector:window','app:title-colors','inspector:context'])ipcMain.handle(channel,()=>false)
   win=new BrowserWindow({show:false,width:1380,height:1000,webPreferences:{preload:path.resolve('dist-electron/preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true,backgroundThrottling:false,offscreen:true}})
   win.webContents.on('console-message',details=>{if(details.level==='error')errors.push(details.message)})
   trackAuthWindow(win.webContents,true)
@@ -153,6 +154,7 @@ async function main(){try{
   assert.ok(requests.some(request=>JSON.stringify(request.messages).includes('能力模块维护程序')))
   const session=await api('newSession')
   for(const text of ['整理数据，不修改原文件','接着完成剩余部分']){
+    const beforeChat=requests.length
     const requestId=randomUUID()
     await evaluate(`globalThis.finishedRequest=null;globalThis.disposeEvents?.();globalThis.disposeEvents=window.myplane.onLocalAiStudioEvent(event=>{if(event.type==='finished'&&event.requestId===${JSON.stringify(requestId)})globalThis.finishedRequest=event});void 0`)
     await service.startChat({sessionId:session.id,requestId,text,model:'fixture-model',webEnabled:false},win.webContents)
@@ -161,12 +163,15 @@ async function main(){try{
     assert.equal(event.error,undefined)
     assert.equal(event.session.abilityState.versionId,candidate)
     assert.equal(event.session.abilityState.selectionVersionId,selectionVersion.id)
+    assert.equal(event.session.messages.at(-1).usageTotals.requests,requests.length-beforeChat,'answer tracks every real request, including planning and review')
   }
   const saved=service.session(session.id)
   assert.equal(saved.abilityState.proposal.intent,'continue')
   assert.ok(saved.abilityState.proposal.constraintMessageIds.includes(saved.messages[0].id))
   assert.ok(requests.some(request=>JSON.stringify(request.messages).includes('对话状态模块生成的参考资料')))
-  for(const moduleId of ['message-intent','clarification-policy','task-planner','tool-selection','completion-review','model-adapter','context-compaction','history-memory']){
+  assert.equal(saved.taskPlan.items.length,1,'outer scheduler persists the fixture plan')
+  assert.equal(requests.filter(request=>request.messages.some(message=>message.role==='system'&&message.content.includes('现在仅规划当前用户任务'))).length,1,'continue reuses the plan rather than planning every worker again')
+  for(const moduleId of ['message-intent','clarification-policy','tool-selection','completion-review','model-adapter','context-compaction','history-memory']){
     assert.ok(fs.readdirSync(path.join(root,'data','ability-modules',moduleId,'replays')).length,`${moduleId} used in actual chat`)
   }
   async function sendRouted(target,text){
@@ -193,7 +198,8 @@ async function main(){try{
   const continued=await sendRouted(session.id,'继续修改')
   assert.equal(continued.abilityTask.id,originalTask)
   assert.equal(continued.messages.at(-1).abilityRoute.action,'continue')
-  assert.ok(requests.length>beforeProgress)
+  assert.equal(requests.length,beforeProgress,'completed plan is not executed again on continue')
+  assert.ok(continued.taskPlan.items.every(item=>item.status==='complete'))
   const beforeNew=requests.length
   const nextTask=await sendRouted(session.id,'新任务：写一首诗')
   assert.notEqual(nextTask.abilityTask.id,originalTask)

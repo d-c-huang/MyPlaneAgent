@@ -17,6 +17,7 @@ export type TaskEvidence = {activityId:string;capability:string;status:'complete
 export type TaskItem = {
   id:string; title:string; acceptance:string;
   kind?:import('./task-contract.js').TaskKind;kindSource?:'explicit'|'migrated'; runtime?:import('./task-contract.js').TaskRuntimeState;
+  kindCorrection?:{from:import('./task-contract.js').TaskKind;reason:string;updatedAt:string};
   parentId?:string;depth?:number;childIds?:string[];
   key?:string;dependsOn?:string[];mode?:'read'|'write'|'verify';parallel?:boolean;fileScope?:string[];
   worker?:{id:string;mode:'read'|'write'|'verify';assignedAt:string;maxRounds?:number;roundLimitSource?:'automatic'|'configured';maxToolCalls?:number;toolLimitSource?:'automatic'|'configured';toolCalls:number;attemptId?:string;startedAt?:string;finishedAt?:string;modelRequests?:number;tokens?:number};

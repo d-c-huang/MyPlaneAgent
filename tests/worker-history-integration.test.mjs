@@ -88,10 +88,12 @@ test('an interrupted tool run restores its actual checkpoint and result after se
  assert.equal(before.checkpoint.compaction.usage.totalTokens,before.checkpoint.compaction.requests*135)
  assert.deepEqual(before.lastCompaction,before.checkpoint.compaction)
  await f.reopen();assert.deepEqual(f.core.runtimeStore.loadWorker(f.scope).lastCompaction,before.lastCompaction);register();resumed=true
- await f.core.runConversation(f.options([{role:'user',content:'继续检查结果，不要重新写入'}],{approvalMode:'ask'}))
+ const restoredContexts=[]
+ await f.core.runConversation(f.options([{role:'user',content:'继续检查结果，不要重新写入'}],{approvalMode:'ask',onContext:value=>restoredContexts.push(value)}))
  const after=f.core.runtimeStore.loadWorker(f.scope)
  assert.equal(writes,1);assert.equal(fs.readFileSync(path.join(f.workspace,'saved.txt'),'utf8'),'done')
  assert.equal(after.phase,'complete');assert.equal(after.generation,before.generation);assert.equal(seenRestored,true)
+ assert.ok(restoredContexts.some(value=>value.recovery?.messages===before.history.length&&value.recovery.generation===before.generation&&value.recovery.unconfirmedEffects===0))
  for(const source of resumedSummarySources){assert.match(source,/已有摘要/);assert.doesNotMatch(source,/旧日志旧日志旧日志/)}
  assert.deepEqual(after.history.slice(0,before.history.length),before.history)
  assert.match(resumedPayload,/ask/);assert.doesNotMatch(resumedPayload,/"approvalMode":"full"/)

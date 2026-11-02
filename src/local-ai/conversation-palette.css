@@ -1,0 +1,202 @@
+/* Color follows the existing appearance's light/dark color-scheme. */
+.chat-workbench {
+  --c-purple: light-dark(#7352ce, #bea6ff);
+  --c-blue: light-dark(#346cbd, #8cbaf7);
+  --c-teal: light-dark(#168373, #6dd8c1);
+  --c-orange: light-dark(#ae672e, #f3b77c);
+  --c-line: color-mix(in srgb, var(--c-purple) 16%, var(--s-border));
+  --c-glow: color-mix(in srgb, var(--c-purple) 10%, transparent);
+  background: var(--s-bg);
+}
+.chat-workbench > .agent-history {
+  background: radial-gradient(ellipse at 0 0, color-mix(in srgb, var(--c-purple) 12%, transparent), transparent 65%),
+    linear-gradient(155deg, color-mix(in srgb, var(--c-blue) 4%, var(--s-rail)), var(--s-rail));
+  border-color: var(--c-line);
+}
+.conversation-brand-mark {
+  width: 34px; height: 34px; border: 1px solid #ffffff40; border-radius: 11px;
+  color: #fff; background: linear-gradient(145deg, #8260d8, #6251c9 60%, #386fba);
+  box-shadow: 0 5px 13px #7858ce28, inset 0 1px #ffffff55;
+}
+.conversation-brand strong { font-size: 13px; letter-spacing: -.3px; }
+.conversation-brand small { margin-top: 3px; letter-spacing: .6px; }
+.agent-history > .new-conversation-button {
+  min-height: 42px; border-color: #ffffff26; color: #fff;
+  background: linear-gradient(115deg, #7652ce, #5d66d0);
+  box-shadow: 0 5px 14px #7052cc23, inset 0 1px #ffffff26;
+}
+.new-conversation-button > span:last-child { color: #ffffffb3; }
+.agent-history > .new-conversation-button:hover:not(:disabled) {
+  background: linear-gradient(115deg, #6841c0, #5865d0); border-color: #a394df;
+  box-shadow: 0 6px 18px #7052cc38;
+}
+.workspace-search { background: color-mix(in srgb, var(--s-panel) 75%, transparent); border-color: var(--c-line); border-radius: 10px; padding: 7px 10px; }
+.chat-workbench :deep(.history-row.selected) {
+  background: linear-gradient(105deg, color-mix(in srgb, var(--c-purple) 14%, var(--s-panel)), color-mix(in srgb, var(--c-blue) 5%, var(--s-panel)));
+  box-shadow: inset 3px 0 var(--c-purple); border-radius: 9px;
+}
+.chat-workbench :deep(.history-row.selected > .session-button) { color: var(--c-purple); font-weight: 550; }
+.agent-main {
+  background: radial-gradient(ellipse at 85% 0, color-mix(in srgb, var(--c-blue) 6%, transparent), transparent 48%),
+    radial-gradient(ellipse at 8% 100%, color-mix(in srgb, var(--c-purple) 5%, transparent), transparent 50%), var(--s-bg);
+}
+.agent-main.is-welcome {
+  background: radial-gradient(ellipse at 82% 23%, color-mix(in srgb, var(--c-purple) 10%, transparent), transparent 48%),
+    radial-gradient(ellipse at 15% 64%, color-mix(in srgb, var(--c-teal) 6%, transparent), transparent 45%), var(--s-bg);
+}
+.agent-toolbar { background: color-mix(in srgb, var(--s-panel) 70%, transparent); border-color: var(--c-line); }
+.workspace-heading .agent-workspace-picker { color: var(--c-purple); }
+.task-list-toggle[aria-expanded=true] {
+  border-color: color-mix(in srgb, var(--c-purple) 26%, var(--s-border));
+  color: var(--c-purple); background: color-mix(in srgb, var(--c-purple) 10%, var(--s-panel));
+}
+.chat-workbench .conversation-run-status { min-height: 48px; border-color: var(--c-line); }
+.chat-workbench .conversation-run-status.working { background: color-mix(in srgb, var(--c-purple) 7%, var(--s-panel)); }
+.chat-workbench .conversation-run-status.attention { background: color-mix(in srgb, var(--c-orange) 7%, var(--s-panel)); }
+.chat-workbench .conversation-run-status.success { background: color-mix(in srgb, var(--c-teal) 7%, var(--s-panel)); }
+.chat-workbench :deep(.working .run-status-dot) { background: var(--c-purple); box-shadow: 0 0 0 4px var(--c-glow); }
+.chat-workbench :deep(.success .run-status-dot) { background: var(--c-teal); }
+.chat-workbench :deep(.attention-link) { border-color: color-mix(in srgb, var(--c-orange) 28%, var(--s-border)); color: var(--c-orange); }
+
+/* Welcome composition: a clear heading, a small vector illustration, three intents. */
+.agent-welcome { max-width: 740px; padding: 28px 0 40px; }
+.welcome-intro { display: flex; align-items: center; justify-content: space-between; gap: 22px; }
+.welcome-copy { min-width: 0; position: relative; z-index: 1; }
+.agent-welcome-label {
+  display: inline-flex; align-items: center; gap: 7px; margin-bottom: 20px; padding: 5px 10px;
+  color: var(--c-purple); background: color-mix(in srgb, var(--c-purple) 9%, var(--s-panel));
+  border: 1px solid color-mix(in srgb, var(--c-purple) 14%, var(--s-border)); border-radius: 20px; font-size: 10px; letter-spacing: .6px;
+}
+.agent-welcome-label svg { width: 13px; height: 13px; }
+.agent-welcome h1 { font-size: clamp(32px, 3.6cqw, 43px); font-weight: 650; line-height: 1.45; letter-spacing: -1.2px; margin: 0 0 14px; }
+.agent-welcome h1 > span {
+  color: var(--c-purple); background: linear-gradient(110deg, var(--c-purple) 8%, var(--c-blue) 64%, var(--c-teal));
+  background-clip: text; -webkit-text-fill-color: transparent;
+}
+.welcome-copy > p { font-size: 13px; color: var(--s-dim); line-height: 1.8; margin: 0; }
+.welcome-illustration { flex: 0 1 210px; width: 210px; height: 190px; min-width: 100px; max-height: 194px; filter: drop-shadow(0 16px 20px #6e56ba15); }
+.conversation-starters { gap: 13px; margin-top: 32px; }
+.conversation-starters button {
+  --card-tone: var(--c-teal);
+  position: relative; display: flex; align-items: flex-start; flex-direction: column; gap: 8px;
+  min-height: 158px; padding: 18px; overflow: hidden; border-radius: 17px;
+  border: 1px solid color-mix(in srgb, var(--card-tone) 22%, var(--s-border));
+  background: linear-gradient(145deg, color-mix(in srgb, var(--card-tone) 10%, var(--s-panel)), var(--s-panel) 84%);
+  box-shadow: 0 4px 16px color-mix(in srgb, var(--card-tone) 6%, transparent);
+  transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+}
+.conversation-starters button:nth-child(2) { --card-tone: var(--c-purple); }
+.conversation-starters button:nth-child(3) { --card-tone: var(--c-orange); }
+.conversation-starters button > .starter-icon {
+  display: grid; place-items: center; width: 35px; height: 35px; margin: 0 0 7px;
+  color: var(--card-tone); background: color-mix(in srgb, var(--card-tone) 13%, var(--s-panel));
+  border: 1px solid color-mix(in srgb, var(--card-tone) 17%, transparent); border-radius: 11px;
+}
+.starter-icon svg { width: 19px; height: 19px; }
+.conversation-starters button > .starter-number { position: absolute; top: 20px; right: 18px; margin: 0; color: var(--card-tone); opacity: .65; font-size: 10px; letter-spacing: 1px; }
+.conversation-starters strong { font-size: 13px; font-weight: 600; }
+.conversation-starters small { font-size: 11px; line-height: 1.6; color: var(--s-dim); padding-right: 8px; }
+.starter-arrow { position: absolute; width: 13px; height: 13px; bottom: 18px; right: 14px; color: var(--card-tone); }
+.conversation-starters button:hover {
+  transform: translateY(-3px); border-color: color-mix(in srgb, var(--card-tone) 56%, var(--s-border));
+  background: linear-gradient(145deg, color-mix(in srgb, var(--card-tone) 15%, var(--s-panel)), var(--s-panel));
+  box-shadow: 0 9px 24px color-mix(in srgb, var(--card-tone) 13%, transparent);
+}
+
+/* Reading surfaces keep contrast while the surrounding accents carry the color. */
+.chat-workbench :deep(.message.user .message-body) {
+  border: 1px solid color-mix(in srgb, var(--c-purple) 20%, var(--s-border)); border-radius: 17px 17px 5px 17px;
+  background: linear-gradient(120deg, color-mix(in srgb, var(--c-purple) 12%, var(--s-panel)), color-mix(in srgb, var(--c-blue) 7%, var(--s-panel)));
+  padding: 11px 17px; box-shadow: 0 3px 10px var(--c-glow);
+}
+.chat-workbench :deep(.assistant-monogram) { color: #fff; background: linear-gradient(140deg, #9270ed, #5c70d6); border-color: #ffffff30; box-shadow: 0 3px 9px #7355c520; border-radius: 8px; }
+.chat-workbench :deep(.message-author strong) { color: var(--c-purple); }
+.chat-workbench :deep(.message-attention) { color: var(--c-orange); background: color-mix(in srgb, var(--c-orange) 10%, var(--s-panel)); border: 1px solid color-mix(in srgb, var(--c-orange) 18%, transparent); }
+.chat-workbench :deep(.execution-flow > summary) { color: var(--c-blue); }
+.chat-workbench :deep(.flow-entries) { border-color: color-mix(in srgb, var(--c-blue) 28%, var(--s-border)); }
+.chat-workbench :deep(.tool-card) { border-radius: 11px; background: color-mix(in srgb, var(--c-blue) 3%, var(--s-panel)); }
+.chat-workbench :deep(.tool-card.complete) { border-color: color-mix(in srgb, var(--c-teal) 24%, var(--s-border)); }
+.chat-workbench :deep(.tool-card.error) { border-color: color-mix(in srgb, var(--s-danger) 28%, var(--s-border)); }
+.agent-main > .agent-composer-wrap { background: transparent; }
+.agent-prompt {
+  border: 1px solid color-mix(in srgb, var(--c-purple) 32%, var(--s-border)); border-radius: 20px;
+  background: linear-gradient(130deg, color-mix(in srgb, var(--c-purple) 3%, var(--s-panel)), var(--s-panel));
+  box-shadow: 0 8px 30px color-mix(in srgb, var(--c-purple) 9%, transparent), 0 2px 5px #00000003;
+}
+.agent-prompt:focus-within { border-color: var(--c-purple); box-shadow: 0 0 0 3px var(--c-glow), 0 10px 32px var(--c-glow); }
+.agent-prompt > footer { border-top: 1px solid color-mix(in srgb, var(--c-purple) 9%, transparent); margin: 0 8px; padding: 9px 0 7px; }
+.agent-prompt .send-button:not(:disabled) { color: #fff; background: linear-gradient(135deg, #9066e5, #5b65d0); box-shadow: 0 3px 10px #7856d53b; border: 1px solid #ffffff26; }
+.agent-prompt .stop-button { color: var(--s-danger); background: color-mix(in srgb, var(--s-danger) 12%, var(--s-panel)); border: 1px solid color-mix(in srgb, var(--s-danger) 22%, transparent); }
+.chat-workbench :deep(.context-dot) { background: var(--c-purple); }
+.chat-workbench :deep(.context-panel) { border-color: var(--c-line); border-radius: 18px; box-shadow: 0 15px 48px #30225126; }
+.chat-workbench :deep(.context-meter i) { background: linear-gradient(90deg, var(--c-blue), var(--c-purple)); }
+.chat-workbench :deep(.context-budget > div) { --budget-tone: var(--c-blue); background: color-mix(in srgb, var(--budget-tone) 9%, var(--s-panel)); border: 1px solid color-mix(in srgb, var(--budget-tone) 15%, var(--s-border)); border-radius: 10px; }
+.chat-workbench :deep(.context-budget > div:nth-child(2)) { --budget-tone: var(--c-purple); }
+.chat-workbench :deep(.context-budget > div:nth-child(3)) { --budget-tone: var(--c-orange); }
+.chat-workbench :deep(.context-budget > div:nth-child(4)) { --budget-tone: var(--c-teal); }
+.chat-workbench :deep(.context-budget dd) { color: var(--budget-tone); }
+
+.floating-task-list { border-color: var(--c-line); background: linear-gradient(180deg, color-mix(in srgb, var(--c-purple) 4%, var(--s-panel)), var(--s-panel) 36%); }
+.task-panel-eyebrow { color: var(--c-purple); }
+.task-list-progress { height: 5px; background: color-mix(in srgb, var(--c-purple) 9%, var(--s-muted)); }
+.task-list-progress span { background: linear-gradient(90deg, #46bda9, #708be6 60%, #9471df); }
+.task-list-goal { border: 1px solid var(--c-line); border-radius: 13px; background: linear-gradient(120deg, color-mix(in srgb, var(--c-purple) 9%, var(--s-panel)), color-mix(in srgb, var(--c-blue) 5%, var(--s-panel))); }
+.task-list-goal > span { color: var(--c-purple); }
+.task-panel-filters button[aria-pressed=true] { color: var(--c-purple); background: color-mix(in srgb, var(--c-purple) 11%, var(--s-panel)); }
+.floating-task-list ol { padding: 12px; }
+.floating-task-list li {
+  --task-tone: var(--c-blue); margin: 0 0 10px; padding: 13px 10px 13px calc(10px + var(--task-depth, 0)*12px);
+  border: 1px solid color-mix(in srgb, var(--task-tone) 16%, var(--s-border)); border-radius: 12px;
+  background: color-mix(in srgb, var(--task-tone) 4%, var(--s-panel));
+}
+.floating-task-list li:last-child { border: 1px solid color-mix(in srgb, var(--task-tone) 16%, var(--s-border)); }
+.floating-task-list .task-complete { --task-tone: var(--c-teal); }
+.floating-task-list .task-blocked { --task-tone: var(--c-orange); }
+.floating-task-list .task-running, .floating-task-list .task-verifying { --task-tone: var(--c-purple); }
+.task-list-mark { border-color: color-mix(in srgb, var(--task-tone) 40%, var(--s-border)); color: var(--task-tone); background: color-mix(in srgb, var(--task-tone) 9%, var(--s-panel)); }
+.task-complete .task-list-mark { color: var(--c-teal); background: color-mix(in srgb, var(--c-teal) 14%, var(--s-panel)); }
+.task-blocked .task-list-mark { color: var(--c-orange); border-color: color-mix(in srgb, var(--c-orange) 36%, var(--s-border)); background: color-mix(in srgb, var(--c-orange) 12%, var(--s-panel)); }
+.task-running .task-list-mark, .task-verifying .task-list-mark { color: var(--c-purple); border-color: var(--c-purple); }
+.task-state-label { color: var(--task-tone); }
+.floating-task-list li p { background: color-mix(in srgb, var(--c-orange) 7%, var(--s-panel)); }
+.task-panel-footer { color: var(--s-dim); border-color: var(--c-line); }
+button:focus-visible, summary:focus-visible { outline-color: var(--c-purple); }
+
+@container conversation (max-width: 760px) {
+  .welcome-illustration { flex-basis: 150px; width: 150px; max-height: 155px; }
+  .welcome-intro { gap: 12px; }
+  .agent-welcome h1 { font-size: 31px; }
+  .conversation-starters { gap: 9px; margin-top: 24px; }
+  .conversation-starters button { padding: 14px 12px; min-height: 150px; }
+  .conversation-starters button > .starter-number { top: 17px; right: 12px; }
+  .conversation-starters small { font-size: 10px; }
+}
+@container conversation (max-width: 520px) {
+  .welcome-illustration { display: none; }
+  .agent-welcome { padding-top: 18px; }
+  .agent-welcome h1 { font-size: 30px; }
+  .agent-welcome-label { margin-bottom: 15px; }
+  .welcome-copy > p { font-size: 12px; }
+  .conversation-starters { gap: 8px; margin-top: 20px; }
+  .conversation-starters button { display: grid; grid-template-columns: 38px minmax(0, 1fr); min-height: 74px; gap: 3px 12px; padding: 12px 16px; align-content: center; }
+  .conversation-starters button > .starter-icon { grid-row: span 2; width: 36px; height: 36px; align-self: center; margin: 0; }
+  .conversation-starters button > .starter-number { display: none; }
+  .conversation-starters button > strong { align-self: end; }
+  .conversation-starters button > small { grid-column: 2; }
+  .starter-arrow { bottom: 30px; right: 16px; }
+}
+@media (max-height: 740px) and (min-width: 761px) {
+  .agent-welcome { padding-block: 16px; }
+  .agent-welcome h1 { font-size: 32px; }
+  .welcome-illustration { max-height: 145px; }
+  .agent-welcome-label { margin-bottom: 10px; }
+  .conversation-starters { margin-top: 20px; }
+  .conversation-starters button { min-height: 130px; padding-block: 13px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .conversation-starters button { transition: none; }
+  .conversation-starters button:hover { transform: none; }
+}
+@media (forced-colors: active) {
+  .agent-welcome h1 > span { background: none; color: CanvasText; -webkit-text-fill-color: CanvasText; }
+}

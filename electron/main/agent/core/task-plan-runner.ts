@@ -4,6 +4,7 @@ import {taskKinds,taskMode,type TaskKind} from '../../../shared/task-contract.js
 import {failureCode} from './execution-result.js'
 import {createTaskScope,scopeInstruction,isWebLookup,projectAdviceRequested,projectCheckTools,projectChecksRequested} from '../../../shared/task-scope.js'
 import {requiresImplementation} from './implementation-stage.js'
+import {recoverTaskKinds} from './task-kind-recovery.js'
 import {recoverReviewQueue} from './review-dispatch.js'
 import {isReadCommand} from './read-evidence.js'
 import {randomUUID} from 'node:crypto'
@@ -121,6 +122,7 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
     if(item.kind==='preview')item.mode='verify'
     item.runtime??={status:item.status==='complete'?'succeeded':item.status==='blocked'?'waiting':'queued',phase:item.kind==='verify'?'verify':'observe',updatedAt:new Date().toISOString()}
   }
+  if(await recoverTaskKinds(plan,options))save()
   const latestVersion=workspaceVersion(options.workspace)
   for(const item of plan.items)if(item.status==='complete'&&item.kind==='verify'&&item.verificationRuns?.at(-1)?.results.some(result=>result.sourceVersion&&result.sourceVersion!==latestVersion)){item.status='pending';item.summary='项目文件已变化，原验收结果需要重新核对';item.runtime={status:'queued',phase:'verify',updatedAt:new Date().toISOString()}}
   plan.editProgress??={files:{},ineffective:0}

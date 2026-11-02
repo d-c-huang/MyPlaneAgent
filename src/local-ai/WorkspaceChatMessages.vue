@@ -29,6 +29,7 @@ const messageUsage=(message:StudioMessage)=>message.usage||readTokenUsage({usage
  <div class="messages">
   <article v-for="({message,entries,artifacts},index) in rows" :key="message.id" :data-message-id="message.id" class="message" :class="message.role">
    <div class="message-body">
+    <header v-if="message.role==='assistant'" class="message-author"><span class="assistant-monogram" aria-hidden="true">M</span><strong>MyPlaneAgent</strong><span v-if="message.outcome==='needs_input'||message.outcome==='blocked'" class="message-attention">{{message.outcome==='needs_input'?'等待补充':'需要处理'}}</span></header>
     <div v-if="message.images?.length" class="message-images"><img v-for="(image,imageIndex) in message.images" :key="imageIndex" :src="image.dataUrl" :alt="image.name" loading="lazy"/></div>
     <template v-if="message.role==='assistant'">
      <details v-if="entries.length" class="execution-flow" :open="active(index)">
@@ -45,7 +46,7 @@ const messageUsage=(message:StudioMessage)=>message.usage||readTokenUsage({usage
      <section v-if="message.content" class="final-answer"><h3 v-if="entries.length">{{outcomeLabel(message)}}</h3><AiMarkdown :text="message.content"/></section>
      <div v-if="message.status==='error'" class="execution-error" role="alert"><strong>本次执行未完成</strong><p>{{message.error||'生成未完成，可以重试。'}}</p></div>
      <p v-else-if="message.status==='stopped'" class="quiet">已停止生成，已执行的操作记录保留。</p>
-     <footer v-if="!active(index)" class="answer-meta"><span v-if="!entries.length&&message.elapsedMs!==undefined">{{formatElapsedTime(message.elapsedMs)}}</span><TokenUsageDisplay :usage="sumTokenUsage([messageUsage(message)])" label="本次 Tokens" compact/></footer>
+     <footer v-if="!active(index)" class="answer-meta"><span v-if="!entries.length&&message.elapsedMs!==undefined">{{formatElapsedTime(message.elapsedMs)}}</span><TokenUsageDisplay :usage="message.usageTotals??sumTokenUsage([messageUsage(message)])" :requests-known="!!message.usageTotals" label="本次 Tokens" compact/></footer>
     </template>
     <AiMarkdown v-else-if="message.content" :text="message.content"/>
     <div v-if="!active(index)" class="message-actions"><button v-if="message.content" class="text-button" @click="$emit('copy',message.content)"><CopyDocument/>复制</button><button v-if="!sending&&message.role==='assistant'&&index===messages.length-1" class="text-button" @click="$emit('regenerate')"><Refresh/>重新生成</button></div>
@@ -54,6 +55,7 @@ const messageUsage=(message:StudioMessage)=>message.usage||readTokenUsage({usage
  </div>
 </template>
 <style scoped>
+.message-body>.message-author{justify-content:flex-start;gap:9px;margin:0 0 15px;color:var(--s-text)}.message-author strong{font-size:11px;font-weight:600}.assistant-monogram{display:grid;place-items:center;width:23px;height:23px;border:1px solid var(--s-border);border-radius:7px;color:var(--s-accent);font-size:11px;font-weight:600;background:var(--s-panel)}.message-attention{margin-left:auto;font-size:10px;color:#a6752b;padding:2px 6px;border-radius:5px;background:color-mix(in srgb,#b58234 8%,var(--s-panel))}
 .messages{width:100%;max-width:800px;margin:auto;padding:24px}.message{margin-bottom:26px;display:flex;min-width:0}.message-body{min-width:0;flex:1}.message-body>header{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:10px;font-size:11px;color:var(--s-dim);margin-bottom:8px}.message.user .message-body{position:relative;background:var(--s-muted);padding:8px 14px;border-radius:12px;max-width:85%;margin-left:auto;flex:0 1 auto}.message :deep(.ai-markdown){font-size:15px;line-height:1.85}.message-images{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}.message-images img{max-width:min(240px,100%);max-height:200px;border-radius:10px;object-fit:contain}.message-actions{display:flex;gap:12px;margin-top:10px}.text-button{display:flex;gap:5px;align-items:center;border:0;background:transparent;color:var(--s-dim);font:inherit;font-size:11px;cursor:pointer;padding:2px 0}.text-button svg{width:13px;height:13px}.reasoning{margin:8px 0 12px;color:var(--s-dim);font-size:12px}.reasoning summary{cursor:pointer}.generating{font-size:12px;color:var(--s-dim)}.quiet,.message-error{font-size:12px;color:var(--s-dim)}.message-error{color:var(--s-danger)}
 .chat-tools{margin:10px 0;font-size:12px}.chat-tools details{border:1px solid var(--s-border);border-radius:9px;margin:6px 0;padding:8px 12px}.chat-tools summary{display:flex;gap:10px;cursor:pointer}.chat-tools summary span{color:var(--s-dim)}.chat-tools pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:230px;overflow:auto;font-size:11px;color:var(--s-dim)}
 .message.user .message-actions{position:absolute;top:100%;right:0;margin-top:0;padding-top:4px;white-space:nowrap;opacity:0;pointer-events:none}

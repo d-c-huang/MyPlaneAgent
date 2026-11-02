@@ -1,5 +1,5 @@
 import {createHash} from 'node:crypto'
-import type {ContextCheckpoint,ContextPinnedState,ContextCompactionReport} from '../../../shared/local-ai-context.js'
+import type {ContextCheckpoint,ContextPinnedState,ContextCompactionReport,ContextRecovery} from '../../../shared/local-ai-context.js'
 import type {StudioToolActivity} from '../../../shared/local-ai-studio.js'
 import type {ContextMessage} from '../../local-ai-context.js'
 import {pinnedContext} from '../../local-ai-context.js'
@@ -12,12 +12,14 @@ export class WorkerContextSession {
  private context:WorkerContext
  private failure?:Error
  readonly restored:boolean
+ readonly recovery?:ContextRecovery
  readonly recoveredEffects:NonNullable<ContextPinnedState['unresolvedEffects']>=[]
  constructor(private store:RuntimeStore,scope:WorkerScope,contract:unknown,history:ContextMessage[],state:ContextPinnedState){
   this.release=store.acquireWorker(scope)
   try{
    const key=createHash('sha256').update(JSON.stringify(contract)).digest('hex'),saved=store.loadWorker(scope)
    const resume=saved&&saved.contract===key&&saved.phase!=='complete'
+   const restoredMessages=saved?.history.length||0
    this.restored=!!resume
    this.context=resume?saved:{scope,generation:(saved?.generation||0)+1,revision:0,contract:key,updatedAt:'',phase:'active',history:history.map(historyMessage),requirements:state.requirements,outbox:[]}
    if(resume){
@@ -28,6 +30,7 @@ export class WorkerContextSession {
     this.context.history.push({role:'user',content:'本 Worker 从已保存的中断点恢复。请按当前任务要求和权限继续，先核对已有工具结果；不要自动重放历史命令、写入或外部操作。'})
    }
    this.context.phase='active'
+   if(resume)this.recovery={restoredAt:new Date().toISOString(),messages:restoredMessages,generation:this.context.generation,workerId:scope.workerId,checkpointSource:this.context.checkpoint?.source,unconfirmedEffects:this.effects.length}
    this.commit()
   }catch(error){this.release();throw error}
  }
@@ -76,7 +79,7 @@ export class WorkerContextSession {
     }
     const evidence=this.store.read(pending.activityId,this.context.scope.taskId,this.context.scope.workspace)
     const result=evidence.result,unknown=evidence.state==='unknown'||!result||result.outcome==='unknown'
-    const activity:StudioToolActivity={id:pending.activityId,capability:pending.capability,args:pending.args,status:result?.success&&!unknown?'complete':'error',output:typeof result?.output==='string'?result.output:result?.output!==undefined?JSON.stringify(result.output):result?.error||'结果未知，请读取执行证据后核对，不能自动重放。'}
+    const activity:StudioToolActivity={id:pending.activityId,capability:pending.capability,args:pending.args,status:result?.success&&!unknown?'complete':'error',...(result?.admissionRejected?{notApplied:true as const}:{}),output:typeof result?.output==='string'?result.output:result?.output!==undefined?JSON.stringify(result.output):result?.error||'结果未知，请读取执行证据后核对，不能自动重放。'}
     output={activityId:activity.id,status:activity.status,capability:activity.capability,output:activity.output,outcome:unknown?'unknown':result?.outcome,restored:true}
     if(unknown)this.recoveredEffects.push({id:activity.id,capability:activity.capability,status:'unknown'})
     this.context.outbox.push(activity)
