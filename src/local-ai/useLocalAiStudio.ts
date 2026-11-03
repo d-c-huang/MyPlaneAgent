@@ -211,6 +211,23 @@ export function useLocalAiStudio(){
    await refreshChatProjects();await newSession(project.id)
   }catch(cause){if(cause!=='cancel'&&cause!=='close')report(cause)}
  }
+ async function projectCommand(id:string,command:string){
+  if(sessionBusy.value)return
+  const item=chatProjects.value.find(project=>project.id===id)
+  if(!item)return
+  try{
+   if(command==='new'){await newSession(id);return}
+   if(command==='reveal'){await api('agentRevealProject',{id});return}
+   let updated:AgentProject
+   if(command==='pin'){
+    updated=await api('agentEditProject',{id,pinned:!item.pinned})
+   }else if(command==='edit'){
+    const result=await ElMessageBox.prompt('修改项目显示名称，工作目录保持不变。','编辑项目',{inputValue:item.name,inputPlaceholder:'项目名称',confirmButtonText:'保存',cancelButtonText:'取消',closeOnClickModal:false,inputValidator:value=>!!value?.trim()&&value.trim().length<=80||'请输入 1–80 个字符的项目名称'})
+    updated=await api('agentEditProject',{id,name:result.value.trim()})
+   }else return
+   await refreshChatProjects()
+  }catch(cause){if(cause!=='cancel'&&cause!=='close')report(cause)}
+ }
  watch(tab,value=>{if(value==='chat'&&ready.value)void refreshChatProjects()})
  async function renameSession(item:StudioSessionSummary){if(sessionRunState(item.id))return;try{const result=await ElMessageBox.prompt('为这段对话取一个名字','重命名对话',{inputValue:item.title,inputValidator:value=>!!value?.trim()||'请输入名称'});await api('updateSession',{id:item.id,title:result.value});const target=chatViews.get(item.id);if(target?.session)target.session.title=result.value;await refreshSessions()}catch(cause){if(cause!=='cancel'&&cause!=='close')report(cause)}}
  async function deleteSession(item:StudioSessionSummary){if(sessionRunState(item.id))return;try{await ElMessageBox.confirm(`删除“${item.title}”？此操作不会删除模型。`,'删除对话',{type:'warning'});await api('deleteSession',{id:item.id});chatViews.delete(item.id);await refreshSessions();if(session.value?.id===item.id){currentChat.value=emptyChatView();if(sessions.value[0])await openSession(sessions.value[0].id);else await newSession()}}catch(cause){if(cause!=='cancel'&&cause!=='close')report(cause)}}
@@ -455,5 +472,5 @@ export function useLocalAiStudio(){
  })
  // Main owns cancellation on window destruction; reloading this view must not cancel tasks.
  onBeforeUnmount(()=>{disposed=true;clearTimeout(pollTimer);unlisten?.()})
- return {activeRunCount,anySending,sessionRunState,chatModelLoading,chatModels,chatModel,selectChatModel,selectingChatModel,chatProjects,chatWorkspacePath,chatWorkspaceLabel,refreshChatProjects,organizeSession,createChatProject,webEnabled,approvalMode,chatWorkspace,chooseChatWorkspace,chatApproval,approvingChat,approveChat,modelsBusy,sessionBusy,images,attaching,pasteImages,removeImage,tab,ready,error,busy,drawer,parameters,data,settings,apiKey,hfToken,connection,connecting,remoteProfiles,sessions,session,sessionFilter,input,model,systemPrompt,pending,requestId,scroller,query,format,sort,searching,searched,results,selected,files,filesBusy,fileFilter,ggufOnly,modelFilter,showMissing,enqueueBusy,sending,downloads,runtime,hardware,activeDownloads,totalSize,localModels,isVisionProjector,localModelKind,localModelState,canStartLocalModel,visibleSessions,visibleFiles,messages,serverModels,workflowModels,canSend,effectiveEndpoint,statusText,online,apiExample,bytes,count,percent,downloadLabel,fit,trackScroll,refreshModels,refreshSessions,newSession,openSession,renameSession,deleteSession,saveSettings,saveRemoteProfile,useRemoteProfile,deleteRemoteProfile,clearKey,connect,switchSource,selectRemoteApiFormat,usePreset,search,selectRepo,enqueue,downloadAction,importModels,removeModel,startModel,stopModel,externalModel,chooseDirectory,chooseRuntime,send,compactSession,stop,composerKey,copy,exportSession,reveal,openLink,catalogSource,catalogUpdatedAt,catalogError,catalogLabel,details,detailsError,readme,readmeBusy,readmeError,loadReadme,selectedFileName,downloadChoices,selectedDownload,selectedDownloadState,downloadSize,downloadParts,modelFormats,parameterLabel,dateLabel}
+ return {activeRunCount,anySending,sessionRunState,chatModelLoading,chatModels,chatModel,selectChatModel,selectingChatModel,chatProjects,chatWorkspacePath,chatWorkspaceLabel,refreshChatProjects,organizeSession,createChatProject,projectCommand,webEnabled,approvalMode,chatWorkspace,chooseChatWorkspace,chatApproval,approvingChat,approveChat,modelsBusy,sessionBusy,images,attaching,pasteImages,removeImage,tab,ready,error,busy,drawer,parameters,data,settings,apiKey,hfToken,connection,connecting,remoteProfiles,sessions,session,sessionFilter,input,model,systemPrompt,pending,requestId,scroller,query,format,sort,searching,searched,results,selected,files,filesBusy,fileFilter,ggufOnly,modelFilter,showMissing,enqueueBusy,sending,downloads,runtime,hardware,activeDownloads,totalSize,localModels,isVisionProjector,localModelKind,localModelState,canStartLocalModel,visibleSessions,visibleFiles,messages,serverModels,workflowModels,canSend,effectiveEndpoint,statusText,online,apiExample,bytes,count,percent,downloadLabel,fit,trackScroll,refreshModels,refreshSessions,newSession,openSession,renameSession,deleteSession,saveSettings,saveRemoteProfile,useRemoteProfile,deleteRemoteProfile,clearKey,connect,switchSource,selectRemoteApiFormat,usePreset,search,selectRepo,enqueue,downloadAction,importModels,removeModel,startModel,stopModel,externalModel,chooseDirectory,chooseRuntime,send,compactSession,stop,composerKey,copy,exportSession,reveal,openLink,catalogSource,catalogUpdatedAt,catalogError,catalogLabel,details,detailsError,readme,readmeBusy,readmeError,loadReadme,selectedFileName,downloadChoices,selectedDownload,selectedDownloadState,downloadSize,downloadParts,modelFormats,parameterLabel,dateLabel}
 }

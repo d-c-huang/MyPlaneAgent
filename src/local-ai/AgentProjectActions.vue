@@ -8,6 +8,8 @@ const emit=defineEmits<{command:[command:string]}>()
 const anchor=ref<HTMLElement>(),open=ref(false),menuStyle=ref<CSSProperties>({})
 const finder=typeof navigator!=='undefined'&&/Mac/.test(navigator.platform)
 function visible(value:boolean){open.value=value;if(value&&anchor.value){const style=getComputedStyle(anchor.value);menuStyle.value=Object.fromEntries(['--s-panel','--s-text','--s-dim','--s-border','--s-muted'].map(key=>[key,style.getPropertyValue(key)]))}}
+function openMenu(){if(!props.disabled){anchor.value?.querySelector<HTMLButtonElement>('.project-more')?.click()}}
+defineExpose({openMenu})
 </script>
 <template>
  <div ref="anchor" class="project-row-actions" :class="{'menu-open':open}">
