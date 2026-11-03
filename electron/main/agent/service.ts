@@ -275,7 +275,8 @@ export class LocalAgentService {
   }
   const pending=run.pending;run.pending=undefined;pending.resolve(approved)
  }
- start(input:{approvalMode?:AgentApprovalMode;fastMode?:boolean;tokenBudget?:number;seed?:StudioSession;images?:StudioImage[];projectId?:string;projectless?:boolean;taskId?:string;workspace?:string;hidden?:boolean;mode:AgentMode;model:string;prompt:string;maxSteps:number;connectionOverride?:AgentConnection},owner:number,emit:(task:AgentTask)=>void){
+ start(input:{execution?:import('../../shared/workflow-execution.js').WorkflowExecutionPolicy;approvalMode?:AgentApprovalMode;fastMode?:boolean;tokenBudget?:number;seed?:StudioSession;images?:StudioImage[];projectId?:string;projectless?:boolean;taskId?:string;workspace?:string;hidden?:boolean;mode:AgentMode;model:string;prompt:string;maxSteps:number;connectionOverride?:AgentConnection},owner:number,emit:(task:AgentTask)=>void){
+  if(input.execution)throw new Error('此工作流包含执行约束，必须通过 Agent Core 执行')
   if([...this.runs.values(),...this.compactions.values()].some(run=>run.owner===owner)||input.taskId&&this.compactions.has(input.taskId))throw new Error('请先完成或停止当前 Agent 任务')
   const prompt=(input.images?.length?String(input.prompt||'').slice(0,16000):bounded(input.prompt,'任务要求',16000)).trim(),model=bounded(input.model,'模型',500),maxSteps=integer(input.maxSteps,20,0,120)
    if(!modes.has(input.mode))throw new Error('任务模式无效')

@@ -34,13 +34,27 @@ export class AgentWorkspace {
   return current
  }
  files(relative='.',depth=5,limit=1200){
-  const base=this.resolve(relative),result:string[]=[];let visited=0,truncated=false
+  const base=this.resolve(relative),result:string[]=[],skipped:{path:string;reason:string}[]=[],reasons=new Set<string>();let visited=0,truncated=false,skippedCount=0
+  const relativePath=(target:string)=>path.relative(this.root,target).split(path.sep).join('/')
+  const skip=(target:string,reason:string)=>{skippedCount++;truncated=true;reasons.add('skipped-paths');if(skipped.length<50)skipped.push({path:relativePath(target),reason})}
   const walk=(dir:string,level:number)=>{
-   if(level>depth){truncated=true;return}
-   const handle=fs.opendirSync(dir)
-   try{let entry:fs.Dirent|null;while((entry=handle.readSync())){if(++visited>5000||result.length>=limit){truncated=true;return}if(ignored.has(entry.name)||secret(entry.name)||entry.isSymbolicLink())continue;const full=path.join(dir,entry.name),rel=path.relative(this.root,full).split(path.sep).join('/');if(entry.isDirectory()){result.push(rel+'/');walk(full,level+1)}else if(entry.isFile())result.push(rel)}}finally{handle.closeSync()}
+   if(level>depth){truncated=true;reasons.add('depth-limit');return}
+   try{
+    const handle=fs.opendirSync(dir)
+    try{let entry:fs.Dirent|null;while((entry=handle.readSync())){
+     if(++visited>5000||result.length>=limit){truncated=true;reasons.add('file-limit');return}
+     if(ignored.has(entry.name.toLowerCase())||secret(entry.name))continue
+     const full=path.join(dir,entry.name),rel=relativePath(full)
+     if(entry.isSymbolicLink()){skip(full,'linked-path');continue}
+     if(entry.isDirectory()){result.push(rel+'/');walk(full,level+1)}else if(entry.isFile())result.push(rel)
+    }}finally{handle.closeSync()}
+   }catch(error){
+    const code=(error as NodeJS.ErrnoException).code
+    if(dir===base||!code)throw error
+    skip(dir,code==='EACCES'||code==='EPERM'?'permission-denied':'unreadable-path')
+   }
   }
-  if(!fs.statSync(base).isDirectory())throw new Error('请选择目录');walk(base,0);return {paths:result,truncated}
+  if(!fs.statSync(base).isDirectory())throw new Error('请选择目录');walk(base,0);return {paths:result,truncated,skipped,skippedCount,truncationReasons:[...reasons].sort()}
  }
  read(relative:unknown){const file=this.resolve(relative),st=fs.statSync(file);if(!st.isFile()||st.size>maxFile)throw new Error('仅可读取 2 MB 以内的文本文件');const data=fs.readFileSync(file);if(data.includes(0))throw new Error('该文件不是文本，请使用文档读取工具');return data.toString('utf8')}
  async query(name:string,args:Record<string,unknown>,signal:AbortSignal){
@@ -55,7 +69,7 @@ export class AgentWorkspace {
   if(name==='search_files'){
    const query=bounded(args.query,'检索词',200),listing=this.files(typeof args.path==='string'?args.path:'.'),matches:{path:string;line:number;text:string}[]=[];let bytes=0,scanned=0
    for(const file of listing.paths){signal.throwIfAborted();if(file.endsWith('/'))continue;try{const content=this.read(file);bytes+=Buffer.byteLength(content);if(bytes>12*1024*1024)break;scanned++;const lines=content.split('\n');for(let i=0;i<lines.length;i++){if(lines[i].toLowerCase().includes(query.toLowerCase()))matches.push({path:file,line:i+1,text:lines[i].slice(0,400)});if(matches.length>=60)break}}catch{/* Skip binary, oversized and unreadable files. */}if(matches.length>=60)break;if(scanned%30===0)await new Promise(resolve=>setImmediate(resolve))}
-   return JSON.stringify({matches,scanned,truncated:listing.truncated||matches.length>=60||bytes>12*1024*1024})
+   return JSON.stringify({matches,scanned,truncated:listing.truncated||matches.length>=60||bytes>12*1024*1024,skippedPaths:listing.skipped,skippedPathCount:listing.skippedCount})
   }
   if(name==='read_document'){const result=JSON.parse(await extractDocument(this.resolve(args.path),args,signal));return JSON.stringify({...result,path:args.path,nextReads:result.nextReads.map((next:Record<string,unknown>)=>({...next,path:args.path}))})}
   throw new Error(`未知读取工具：${name}`)
@@ -171,7 +185,14 @@ export class AgentWorkspace {
   }}
  }
  private async git(name:string,args:Record<string,unknown>,signal:AbortSignal){
-  const meta=path.join(this.root,'.git');if(!fs.existsSync(meta)||fs.lstatSync(meta).isSymbolicLink())throw new Error('需要项目根目录中的 Git 仓库，不能使用符号链接')
+  const meta=path.join(this.root,'.git')
+  let metadata:fs.Stats
+  try{metadata=fs.lstatSync(meta)}catch(error){
+   if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error
+   if(name==='git_status')return JSON.stringify({repository:false,status:'not_applicable',note:'当前工作目录不是 Git 仓库根目录，未执行 Git 状态查询。可继续使用文件读取工具；需要 Git 操作时请选择实际项目根目录。不要仅为状态查询初始化仓库。'})
+   throw new Error('需要项目根目录中的 Git 仓库')
+  }
+  if(metadata.isSymbolicLink())throw new Error('Git 元数据不能使用符号链接或目录联接')
   const base=['--no-pager','-c','core.fsmonitor=false','-c','core.untrackedCache=false','-c','core.hooksPath=/dev/null','-c','diff.external=','-c','core.pager=cat']
   const execute=(more:string[])=>new Promise<string>((resolve,reject)=>{
    signal.throwIfAborted();let output='',settled=false
@@ -181,7 +202,7 @@ export class AgentWorkspace {
    child.stdout.on('data',chunk=>{output+=chunk.toString();if(output.length>32000)kill()});child.stderr.on('data',chunk=>{output+=chunk.toString();if(output.length>32000)kill()});child.on('error',finish);child.on('close',code=>finish(signal.aborted?new Error('已停止'):code!==0?new Error('Git 未成功：'+output.slice(0,1000)):undefined))
   })
   const root=(await execute(['rev-parse','--show-toplevel'])).trim();if(fs.realpathSync(root)!==this.root)throw new Error('Git 根目录与项目目录不一致')
-  if(name==='git_status')return JSON.stringify({output:await execute(['status','--short','--untracked-files=no','--ignore-submodules=all'])})
+  if(name==='git_status')return JSON.stringify({repository:true,output:await execute(['status','--short','--untracked-files=no','--ignore-submodules=all'])})
   if(name==='git_log')return JSON.stringify({output:await execute(['log','-n',String(integer(args.limit,10,1,30)),'--format=%h %s'])})
   const staged=args.staged===true?['--cached']:[]
   const names=(await execute(['diff',...staged,'--name-only','-z','--ignore-submodules=all'])).split('\0').filter(Boolean).filter(name=>{try{this.resolve(name,true);return true}catch{return false}}).slice(0,100)

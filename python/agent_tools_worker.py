@@ -1,6 +1,7 @@
 """MyPlane Agent tool worker. One JSON request on stdin, one JSON response on stdout."""
 from __future__ import annotations
 import ast, contextlib, csv, difflib, fnmatch, hashlib, io, ipaddress, json, mimetypes, os, pathlib, posixpath, re, shutil, socket, subprocess, sys, tarfile, tempfile, time, urllib.error, urllib.parse, urllib.request, zipfile
+import stat as statlib
 from html import escape, unescape
 from xml.etree import ElementTree as ET
 
@@ -28,6 +29,9 @@ def invalidate(root,paths=None):
             if key[0].startswith(prefix): TEXT_CACHE.pop(key,None)
     for key in list(LIST_CACHE):
         if key[0]==str(root): LIST_CACHE.pop(key,None)
+def linked_stat(metadata):
+    return statlib.S_ISLNK(metadata.st_mode) or bool(getattr(metadata,'st_file_attributes',0)&getattr(statlib,'FILE_ATTRIBUTE_REPARSE_POINT',0x400))
+
 def resolve(root,value,missing=False):
     if not isinstance(value,str) or not value.strip() or len(value)>2000 or '\\' in value or '\0' in value or ':' in value or pathlib.PurePath(value).is_absolute(): raise ValueError('请使用工作区内的相对路径')
     parts=[p for p in value.split('/') if p and p!='.']
@@ -36,10 +40,12 @@ def resolve(root,value,missing=False):
     current=root
     for part in parts:
         current=current/part
-        if current.exists():
-            if current.is_symlink(): raise ValueError('不允许访问符号链接')
-            if current.is_file() and current.stat().st_nlink>1: raise ValueError('不允许访问具有多个硬链接的文件')
-        elif not missing: raise FileNotFoundError(str(value))
+        try: metadata=current.lstat()
+        except FileNotFoundError:
+            if not missing: raise FileNotFoundError(str(value))
+            continue
+        if linked_stat(metadata): raise ValueError('不允许访问符号链接、目录联接或重解析点')
+        if statlib.S_ISREG(metadata.st_mode) and metadata.st_nlink>1: raise ValueError('不允许访问具有多个硬链接的文件')
     return target
 def read_text(root,name):
     file=resolve(root,name);stat=file.stat()
@@ -52,30 +58,55 @@ def read_text(root,name):
     for old in [item for item in TEXT_CACHE if item[0]==str(file) and item!=key]: TEXT_CACHE.pop(old,None)
     TEXT_CACHE[key]=text;trim_cache(TEXT_CACHE,512);return text
 def directory_stamp(folder):
-    stat=folder.stat();return (stat.st_mtime_ns,tuple(sorted(item.name for item in folder.iterdir())))
+    metadata=folder.lstat()
+    if linked_stat(metadata): raise OSError('目录已变为链接')
+    return (metadata.st_mtime_ns,tuple(sorted(item.name for item in folder.iterdir())))
 def listing(root,relative='.',depth=4,limit=500):
     base=resolve(root,relative);key=(str(root),str(base),depth,limit);cached=LIST_CACHE.get(key)
     if cached:
         try:
-            if all(directory_stamp(pathlib.Path(folder))==stamp for folder,stamp in cached[0]): return {'paths':list(cached[1]['paths']),'truncated':cached[1]['truncated'],'cached':True}
+            if all(directory_stamp(pathlib.Path(folder))==stamp for folder,stamp in cached[0]): return {**cached[1],'paths':list(cached[1]['paths']),'cached':True}
         except OSError: pass
-    result=[];visited=0;truncated=False;directories=[]
+    result=[];visited=0;truncated=False;directories=[];skipped=[];skipped_count=0;reasons=set()
+    def skip(target,reason):
+        nonlocal skipped_count,truncated
+        skipped_count+=1;truncated=True;reasons.add('skipped-paths')
+        if len(skipped)<50: skipped.append({'path':target.relative_to(root).as_posix(),'reason':reason})
     def walk(folder,level):
         nonlocal visited,truncated
-        if level>depth: truncated=True;return
-        children=sorted(folder.iterdir(),key=lambda p:p.name.lower());directories.append((str(folder),(folder.stat().st_mtime_ns,tuple(sorted(child.name for child in children)))))
+        if level>depth: truncated=True;reasons.add('depth-limit');return
+        try:
+            metadata=folder.lstat()
+            if linked_stat(metadata): skip(folder,'linked-path');return
+            children=sorted(folder.iterdir(),key=lambda p:p.name.lower())
+            directories.append((str(folder),(metadata.st_mtime_ns,tuple(sorted(child.name for child in children)))))
+        except OSError as error:
+            if folder==base: raise
+            skip(folder,'permission-denied' if isinstance(error,PermissionError) else 'unreadable-path');return
         for child in children:
             visited+=1
-            if visited>5000 or len(result)>=limit: truncated=True;return
-            if child.name in IGNORED or SECRET.search(child.name) or child.is_symlink(): continue
+            if visited>5000 or len(result)>=limit: truncated=True;reasons.add('file-limit');return
+            if child.name.lower() in IGNORED or SECRET.search(child.name): continue
             rel=child.relative_to(root).as_posix()
-            if child.is_dir(): result.append(rel+'/');walk(child,level+1)
-            elif child.is_file(): result.append(rel)
+            try: metadata=child.lstat()
+            except OSError as error:
+                skip(child,'permission-denied' if isinstance(error,PermissionError) else 'unreadable-path');continue
+            if linked_stat(metadata): skip(child,'linked-path');continue
+            if statlib.S_ISDIR(metadata.st_mode): result.append(rel+'/');walk(child,level+1)
+            elif statlib.S_ISREG(metadata.st_mode): result.append(rel)
     if not base.is_dir(): raise ValueError('请选择目录')
-    walk(base,0);value={'paths':result,'truncated':truncated};LIST_CACHE[key]=(directories,value);trim_cache(LIST_CACHE,64);return value
+    walk(base,0);value={'paths':result,'truncated':truncated,'truncationReasons':sorted(reasons),'skipped':skipped,'skippedCount':skipped_count}
+    # A previously denied directory may become readable without changing its parent.
+    if skipped_count: LIST_CACHE.pop(key,None)
+    else: LIST_CACHE[key]=(directories,value);trim_cache(LIST_CACHE,64)
+    return value
 def git(root,args,action):
     meta=root/'.git'
-    if not meta.exists() or meta.is_symlink(): raise ValueError('需要项目根目录中的 Git 仓库')
+    try: metadata=meta.lstat()
+    except FileNotFoundError:
+        if action=='git_status': return compact({'repository':False,'status':'not_applicable','note':'当前工作目录不是 Git 仓库根目录，未执行 Git 状态查询。可继续使用文件读取工具；需要 Git 操作时请选择实际项目根目录。不要仅为状态查询初始化仓库。'})
+        raise ValueError('需要项目根目录中的 Git 仓库')
+    if linked_stat(metadata): raise ValueError('Git 元数据不能使用符号链接、目录联接或重解析点')
     env={'PATH':os.environ.get('PATH',''),'SystemRoot':os.environ.get('SystemRoot',''),'GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'NUL' if os.name=='nt' else '/dev/null','GIT_TERMINAL_PROMPT':'0','GIT_OPTIONAL_LOCKS':'0','GIT_LITERAL_PATHSPECS':'1'}
     base=['git','--no-pager','-c','core.fsmonitor=false','-c','core.untrackedCache=false','-c','core.hooksPath=/dev/null','-c','diff.external=','-c','core.pager=cat']
     def run(more):
@@ -84,7 +115,7 @@ def git(root,args,action):
         if done.returncode: raise ValueError('Git 未成功：'+output[:1000])
         return output
     if pathlib.Path(run(['rev-parse','--show-toplevel']).strip()).resolve()!=root: raise ValueError('Git 根目录与项目目录不一致')
-    if action=='git_status': return compact({'output':run(['status','--short','--untracked-files=no','--ignore-submodules=all'])})
+    if action=='git_status': return compact({'repository':True,'output':run(['status','--short','--untracked-files=no','--ignore-submodules=all'])})
     if action=='git_log': return compact({'output':run(['log','-n',str(max(1,min(30,int(args.get('limit',10))))),'--format=%h %s'])})
     if action in ('git_show','git_blame'):
         ref=str(args.get('ref','HEAD'))
@@ -911,7 +942,7 @@ def builtin(tool,args,context):
                 found+=1
             if has_more: break
         truncated=scan['truncated'] or has_more or line_truncated or skipped>0
-        return compact({'matches':matches,'scanned':scanned,'skipped':skipped,'offset':offset,'nextOffset':offset+len(matches) if has_more else None,'truncated':truncated,'truncationReasons':[reason for reason,condition in [('file-limit',scan['truncated']),('more-matches',has_more),('long-lines',line_truncated),('unreadable-files',skipped>0)] if condition]})
+        return compact({'matches':matches,'scanned':scanned,'skipped':skipped,'skippedPaths':scan['skipped'],'skippedPathCount':scan['skippedCount'],'offset':offset,'nextOffset':offset+len(matches) if has_more else None,'truncated':truncated,'truncationReasons':scan['truncationReasons']+[reason for reason,condition in [('more-matches',has_more),('long-lines',line_truncated),('unreadable-files',skipped>0)] if condition]})
     if tool=='read_document': return read_document(root,args)
     if tool in {'write_file','replace_text','apply_patch','create_document','replace_document_text','create_spreadsheet','update_spreadsheet_cells','run_command','run_test'}: return prepare_write(root,tool,args)
     raise ValueError('未知 Python 内置工具：'+tool)

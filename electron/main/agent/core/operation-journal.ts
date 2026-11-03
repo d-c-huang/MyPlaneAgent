@@ -4,6 +4,7 @@ import {createHash} from 'node:crypto'
 import {readTools} from '../tools.js'
 import {previewCapabilityNames} from '../static-preview.js'
 import type {Capability} from '../../../shared/types/capability.js'
+import {isReadOnlyCommand} from './read-only-command.js'
 export type OperationJournal = Record<string,{status:'started'|'succeeded'|'failed';updatedAt:string;expectedFiles?:ReturnType<typeof inspectTextEdit>}>
 function stable(value:unknown):unknown{
   if(Array.isArray(value))return value.map(stable)
@@ -21,6 +22,7 @@ export function journalRequired(capability:Capability,args:Record<string,unknown
   if(capability.source.type==='mcp')return true
   if(capability.source.type==='builtin')return !previewCapabilityNames.has(capability.name)&&!['browser.open','browser.read_page','browser.inspect','browser.screenshot'].includes(capability.name)
   if(!['agent-tools','git-operations','file-operations'].includes(capability.source.skillId))return true
+  if(isReadOnlyCommand(capability.name,args))return false
   const name=capability.name.replace(/^agent\./,'')
   if(name==='http_request'&&['GET','HEAD'].includes(String(args.method??'GET').toUpperCase()))return false
   return !readTools.has(name)&&!['get_diagnostics','run_test','run_test_case','build_project','web_search','web_fetch','inspect_build','read_history','read_tool_result','reconcile_execution'].includes(name)

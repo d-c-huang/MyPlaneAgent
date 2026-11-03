@@ -5,6 +5,17 @@ export const titleBarHeight=36
 export function windowChrome():BrowserWindowConstructorOptions{
  return process.platform==='win32'?{titleBarStyle:'hidden',titleBarOverlay:{color:'#f5f5f5',symbolColor:'#444444',height:titleBarHeight},autoHideMenuBar:true}:{}
 }
+/** Keep registered application accelerators without exposing a menu bar in the chat window. */
+export function useMinimalWindowChrome(window:BrowserWindow){
+ if(process.platform==='darwin')return
+ window.setAutoHideMenuBar(true)
+ window.setMenuBarVisibility(false)
+ window.webContents.on('before-input-event',(event,input)=>{
+  const standaloneAlt=input.key==='Alt'&&!input.control&&!input.meta
+  const menuFocus=input.key==='F10'&&!input.control&&!input.meta&&!input.shift&&!input.alt
+  if(standaloneAlt||menuFocus){event.preventDefault();window.setMenuBarVisibility(false)}
+ })
+}
 export function registerTitleMenu(){
  protectedHandle('app:title-colors',(event,color,symbolColor)=>{
   const valid=(value:unknown)=>typeof value==='string'&&/^(#[\da-f]{6}|rgba?\([\d.,\s%]+\)|color\(srgb [\d.\s/]+\))$/i.test(value)

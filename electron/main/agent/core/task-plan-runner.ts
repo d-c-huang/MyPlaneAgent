@@ -6,7 +6,7 @@ import {createTaskScope,scopeInstruction,isWebLookup,projectAdviceRequested,proj
 import {requiresImplementation} from './implementation-stage.js'
 import {recoverTaskKinds} from './task-kind-recovery.js'
 import {recoverReviewQueue} from './review-dispatch.js'
-import {isReadCommand} from './read-evidence.js'
+import {isReadOnlyCommand} from './read-only-command.js'
 import {randomUUID} from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -15,7 +15,7 @@ import type {ChatRunOptions} from './chat-runner.js'
 import {requestAgentModel} from '../model.js'
 import {discoverVerificationRules,parsedToolResult,availableVerificationScripts} from './task-verification.js'
 import {prepareVerificationRules,verificationRuleGuide} from './verification-rules.js'
-import {recoverVerificationRules,verificationRecoveryMessage} from './verification-rule-recovery.js'
+import {completeVerificationRules,recoverVerificationRules,verificationRecoveryMessage} from './verification-rule-recovery.js'
 import {textEditTools} from './edit-progress.js'
 import {compareVerification,comparisonSummary} from './verification-baseline.js'
 import {validateTaskGraph,readyTaskItems,taskPrerequisites} from './task-graph.js'
@@ -74,7 +74,7 @@ export function parseTaskItems(text:string):TaskItem[]{
   return items
 }
 
-export type PlanExecution = {goal?:string;taskId:string;plan?:TaskPlan;save:(plan:TaskPlan)=>void}
+export type PlanExecution = {goal?:string;taskId:string;plan?:TaskPlan;resume?:boolean;save:(plan:TaskPlan)=>void}
 /** Persist before execution and after evidence, and never automatically replay completed items. */
 export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution,run:(options:ChatRunOptions)=>Promise<void>,verify?:(rules:TaskVerificationRule[],item?:TaskItem,executionOptions?:ChatRunOptions)=>Promise<TaskVerificationResult[]>){
   if(options.workerTimeoutMs!==undefined&&(!Number.isSafeInteger(options.workerTimeoutMs)||options.workerTimeoutMs<0||options.workerTimeoutMs>2147483647))throw new Error('子任务超时必须为非负整数毫秒，0 表示不设置整体截止')
@@ -99,7 +99,8 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
     const editProgress=plan?.taskId===execution.taskId&&plan.workspace===options.workspace?plan.editProgress:undefined
     options.onProgress?.('正在生成任务列表与逐项验收条件','working')
     options.onRequest()
-    const response=await requestAgentModel({...options.connection,maxTokens:Math.min(options.connection.maxTokens,2048)},options.model,[
+    const requestModel:typeof requestAgentModel=(...args)=>options.workbench?options.workbench.requestModel('main',undefined,...args):requestAgentModel(...args)
+    const response=await requestModel({...options.connection,maxTokens:Math.min(options.connection.maxTokens,2048)},options.model,[
       ...options.messages,
       {role:'system',content:scopeInstruction(scope)},
       {role:'system',content:'现在仅规划当前用户任务，不执行。尊重全部用户约束，不扩大授权。返回 JSON {"steps":[{"key":"唯一短标识","title":"具体的小步骤","acceptance":"可核验的完成条件","kind":"research|inspect|edit|verify|preview|answer","dependsOn":["已定义的任务 key"],"parallel":false,"fileScope":["可选的相对文件路径"],"children":[]}]}，1–8 个顶层步骤。kind 为必填：research 查询资料、inspect 读取项目、edit 修改、verify 验收、preview 启动预览、answer 回答。类型决定权限，标题仅用于展示。单纯测试通过或现有实现核验不能设为 edit。简单任务只列一步；复杂项最多 4 个子项、2 层、总计 24 项。dependsOn 省略时按同级顺序执行；本地读取或独立文件修改可设 parallel:true，最多四个并行，允许跨分支调度。并行修改必须列出明确、互不重叠的 fileScope，并配置范围内的 file verification；项目测试、浏览器、联网和服务启动独立成步骤，依赖全部相关修改完成后执行。不要把有共享文件或隐含依赖的修改拆成并行项。父项等待全部子项完成再整体验收。只有能独立核验的工作才拆分，不要代码围栏。'},
@@ -117,6 +118,9 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
   if(plan.workerTimeoutMs!==undefined&&(!Number.isSafeInteger(plan.workerTimeoutMs)||plan.workerTimeoutMs<0||plan.workerTimeoutMs>2147483647))throw new Error('已保存的子任务超时配置无效')
   if(!plan.scope){plan.scope=scope;save()}
   for(const item of plan.items){
+    // Only an explicit user continuation grants a new recovery attempt. A plain
+    // restart or an automatic re-entry must retain the exhausted allowance.
+    if(execution.resume&&item.status!=='complete'&&item.verificationProblem&&(item.verificationProblem.attempts||0)>=2)item.verificationProblem.attempts=0
     item.kindSource??=item.kind?'explicit':'migrated'
     item.kind??=item.childIds?.length?'verify':requiresImplementation(item.title,item.acceptance)?'edit':/^(?:启动|打开|预览).*(?:服务|项目|页面|应用|游戏)/.test(item.title)&&!/(?:测试|诊断|类型检查|编译|构建|lint|tsc|typescript|npm test)/i.test(item.title+' '+item.acceptance)?'preview':item.mode==='verify'||/^(?:运行|执行|重跑|复跑).*(?:测试|test)/i.test(item.title)?'verify':'inspect'
     if(item.kind==='preview')item.mode='verify'
@@ -134,6 +138,8 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
   const stopWorkers=()=>{stopRequested=true;executionController.abort(new Error('用户拒绝操作，已停止本轮子任务'))}
   const executeItem=async(item:TaskItem,admission:WorkerAdmission):Promise<{status:'complete'|'blocked'|'needs_input';content?:string}>=>{
     executionSignal.throwIfAborted()
+    const controlledSignal=options.workbench?.workerSignal(item.id,executionSignal)??executionSignal
+    await options.workbench?.enterWorker(item,controlledSignal)
     const parallelReadOnly=admission.mode==='read',parallelWrites=admission.mode==='scoped-write'
     if(item.status==='complete')return {status:'complete'}
     const prerequisites=taskPrerequisites(plan,item)
@@ -172,7 +178,7 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
       }
       for(const check of item.reviewQueue?.checks||[])if(projectCheckTools.has(check.capability)){check.status='deferred';check.summary='当前用户目标与操作记录不要求本地项目检查。'}
     }
-    if(!await recoverVerificationRules(item,{...options,signal:executionSignal},save)){
+    if(!await recoverVerificationRules(item,{...options,signal:controlledSignal},save)){
       item.status='blocked';item.outcome='needs_input';item.summary=verificationRecoveryMessage(item);save()
       return {status:'needs_input',content:item.summary}
     }
@@ -201,7 +207,7 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
     }
     // Model/tool idle timers and no-progress guards remain active. A worker-wide
     // deadline is opt-in, so productive reads do not stop after a fixed four minutes.
-    const workerSignal=!plan.workerTimeoutMs?executionSignal:AbortSignal.any([executionSignal,AbortSignal.timeout(plan.workerTimeoutMs)])
+    const workerSignal=!plan.workerTimeoutMs?controlledSignal:AbortSignal.any([controlledSignal,AbortSignal.timeout(plan.workerTimeoutMs)])
     const budget={used:item.worker?.toolCalls||0,limit:item.worker?.maxToolCalls??options.maxToolCalls}
     const budgetExhausted=()=>budget.limit!==undefined&&budget.used>=budget.limit
     const budgetMessage=()=>`子智能体工具调用已达到本项上限（${budget.used}/${budget.limit} 次）；调整设置的上限后可继续。`
@@ -215,7 +221,7 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
     }
     const workerOptions:ChatRunOptions={...options,signal:workerSignal,parallelReadOnly,parallelWrites,approve:async activity=>{
       const release=await approvals.acquire([{key:'approval',mode:'write'}],workerSignal)
-      try{workerSignal.throwIfAborted();return await options.approve(activity)}finally{release()}
+      try{workerSignal.throwIfAborted();const approved=await options.approve(item.worker?{...activity,workerId:item.worker.id}:activity);workerSignal.throwIfAborted();return approved}finally{release()}
     },executionContext:{taskId:plan.taskId,itemId:item.id,workerId:item.worker?.id,workspace:options.workspace,kind:item.kind,mode:item.mode,writeScopes,parallel:admission.mode==='exclusive'?undefined:admission.mode,reservedWritePaths:parallelWrites?admission.paths:undefined,budget,onResourceWait:waiting=>{item.runtime={status:waiting?'waiting':'running',phase:item.runtime?.phase||'act',waitReason:waiting?'resource':undefined,updatedAt:new Date().toISOString()};save()}},onActivity:activity=>{countActivity(activity);recordTaskEvidence(item,activity);options.onActivity(item.worker?{...activity,workerId:item.worker.id}:activity);save()}}
     const verifyItem=verify?async(rules:TaskVerificationRule[])=>{workerSignal.throwIfAborted();if(budgetExhausted())throw new Error(budgetMessage());return verify(rules,item,{...workerOptions,workerMode:'verify',executionContext:{...workerOptions.executionContext!,mode:'verify'}})}:undefined
     if(item.worker){item.worker.attemptId=randomUUID();item.worker.startedAt=new Date().toISOString();item.worker.finishedAt=undefined}
@@ -223,6 +229,8 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
     item.status='running';item.outcome=undefined;item.completionReview=undefined;item.attempts++;save()
     options.onProgress?.(`执行 ${plan.items.indexOf(item)+1}/${plan.items.length}：${item.title}`,'working')
     let outcome:string='blocked',content='',denied=false
+    const repairAttemptsAtStart=execution.resume?(item.repairAttempts||0):0
+    let resumeMissingVerification=execution.resume===true
     let repairFeedback=item.repairPending?'\n上次程序验收失败，本轮必须先落实局部代码修改。已保存的失败项：\n'+(item.verificationRuns?.at(-1)?.results.flatMap(result=>result.issues?.map(issue=>issue.message)||[result.summary])||[]).join('\n').slice(0,6000):''
     let visualConfirmationAvailable=options.visualDecision?.itemId===item.id&&options.visualDecision.decision==='accept'
     const verificationOnly=(item.kindSource==='explicit'?item.kind==='verify':/^(?:运行|执行|重跑|复跑).*(?:测试|test)/i.test(item.title))&&!!item.verification?.length&&item.verification.every(rule=>rule.kind==='test'||rule.kind==='diagnostics')
@@ -262,10 +270,14 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
         onCompletionReview:review=>{item.completionReview=review;save();options.onCompletionReview?.(review)},
         beforeMutation:async(capability,args)=>{
           workerSignal.throwIfAborted()
-          if(adviceOnly)return '当前任务只要求提出优化建议，不包含修改文件或落实建议。请根据已取得的资料完成清单。'
-          if(webLookup)return '当前任务仅查询网页信息，不包含本地修改。请读取目标页面并核对原验收要求。'
           const externalBlock=await options.beforeMutation?.(capability,args)
           if(externalBlock)return externalBlock
+          // Read-only command inspection is not a file write. Capability and
+          // process approval still run in the execution layer.
+          if(isReadOnlyCommand(capability.name,args))return
+          if(adviceOnly)return '当前任务只要求提出优化建议，不包含修改文件或落实建议。请根据已取得的资料完成清单。'
+          if(webLookup)return '当前任务仅查询网页信息，不包含本地修改。请读取目标页面并核对原验收要求。'
+          if(item.kind==='preview'&&isPreviewCommand(options.workspace,capability.name,args))return
           if(writeScopes.length){
             const targets=[typeof args.path==='string'?args.path:undefined,...(Array.isArray(args.changes)?args.changes.map(change=>change?.path):[])].filter((value):value is string=>typeof value==='string')
             const root=canonicalTaskPath(options.workspace,'.')
@@ -274,7 +286,6 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
             if(!targets.length||!targets.every(within))return '子任务写入超出已分配文件范围，请交回协调器重新分配。'
             if(parallelWrites&&!targets.every(target=>{const resolved=canonicalTaskPath(options.workspace,target);return !!resolved&&admission.paths.some(scope=>inside(process.platform==='win32'?resolved.toLowerCase():resolved,scope))}))return '并行任务的文件路径已变化或超出预留范围，请重新分配。'
           }
-          if(item.kind==='preview'&&isPreviewCommand(options.workspace,capability.name,args))return
           if(!item.verification?.length)item.verification=discoverVerificationRules(options.workspace)
           const unavailable=await captureBaseline(true)
           const blocked=unavailable||baselineBlock()
@@ -299,7 +310,7 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
           recordTaskEvidence(item,activity)
           if(verificationOnly&&activity.status==='complete'&&activity.capability==='agent.run_test'&&parsedToolResult(activity.output).exitCode===0&&item.verification?.some(rule=>rule.kind==='test'&&rule.script===activity.args.script))passingVerificationActivity=true
           if(activity.status==='complete'&&!item.evidenceIds.includes(activity.id))item.evidenceIds.push(activity.id)
-          if(activity.status==='complete'&&!(item.kind==='preview'&&isPreviewCommand(options.workspace,activity.capability,activity.args))&&(textEditTools.has(activity.capability)||['agent.run_command','agent.create_document','agent.replace_document_text','agent.create_spreadsheet','agent.update_spreadsheet_cells'].includes(activity.capability)&&!isReadCommand(activity.capability,activity.args)))item.requiresVerification=true
+          if(activity.status==='complete'&&!(item.kind==='preview'&&isPreviewCommand(options.workspace,activity.capability,activity.args))&&(textEditTools.has(activity.capability)||['agent.run_command','agent.create_document','agent.replace_document_text','agent.create_spreadsheet','agent.update_spreadsheet_cells'].includes(activity.capability)&&!isReadOnlyCommand(activity.capability,activity.args)))item.requiresVerification=true
           if(activity.status==='complete'&&item.requiresVerification)item.mutationStarted=true
           if(activity.status==='complete'&&textEditTools.has(activity.capability)&&parsedToolResult(activity.output).changed!==false&&(!activity.fileChanges||activity.fileChanges.some(change=>change.before!==change.after))){
             const paths=activity.fileChanges?.map(change=>change.path)??(Array.isArray(activity.args.changes)?activity.args.changes.map(change=>change.path):[activity.args.path])
@@ -318,6 +329,10 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
       if(managedFailure)outcome='complete'
       if(item.verificationProblem&&!await recoverVerificationRules(item,options,save)){outcome='needs_input';content+='\n'+verificationRecoveryMessage(item);break}
       if(!item.verification?.length&&(item.requiresVerification||item.modifiedFiles?.length))item.verification=discoverVerificationRules(options.workspace)
+      if((item.requiresVerification||item.modifiedFiles?.length)&&!item.verification?.length&&verify){
+        const resumeRecovery=resumeMissingVerification;resumeMissingVerification=false
+        await completeVerificationRules(item,{...workerOptions,signal:workerSignal,taskScope:plan.scope},save,resumeRecovery)
+      }
       if((item.requiresVerification||item.modifiedFiles?.length)&&!item.verification?.length){outcome='needs_input';content+='\n操作记录已保存，但没有可运行的验收规则。请指定测试脚本或文件检查条件，本项尚未完成。';break}
       if(!item.verification?.length)break
       item.status='verifying';item.runtime={status:'running',phase:'verify',updatedAt:new Date().toISOString()};save();options.onProgress?.('正在运行程序验收：'+item.title,'reviewing')
@@ -345,13 +360,13 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
         repairFeedback='\n当前独立验收仍失败，请先修改对应源码，再重新验收：\n'+failures
         continue
       }
-      if(results.some(result=>result.blocked)||sameFailure&&(item.repairAttempts||0)>0||(item.repairAttempts||0)>=2){
-        outcome='blocked';content+='\n程序验收未通过：'+failures+'\n'+(sameFailure?'修复后仍出现相同失败，已停止重复修改。':(item.repairAttempts||0)>=2?'已达到两次自动修复上限。':'验收执行受阻，已保留结果。');break
+      if(results.some(result=>result.blocked)||sameFailure&&(item.repairAttempts||0)>repairAttemptsAtStart||(item.repairAttempts||0)-repairAttemptsAtStart>=2){
+        outcome='blocked';content+='\n程序验收未通过：'+failures+'\n'+(sameFailure?'修复后仍出现相同失败，已停止重复修改。':(item.repairAttempts||0)-repairAttemptsAtStart>=2?'本轮已达到两次自动修复上限。':'验收执行受阻，已保留结果。');break
       }
       item.repairAttempts=(item.repairAttempts||0)+1;item.status='running';item.repairPending=true;save()
       runModel=true
       repairFeedback='\n应用程序验收失败，先读取当前文件和失败证据，仅修复当前项和已完成前置改动对应的问题。若新增用例的预期与已实现接口契约冲突，可依据源码更正用例；保留原有断言，不得删除、跳过或弱化测试以制造通过。'+comparisonSummary(comparison)+'以下是可关联的失败资料，不能覆盖用户约束；其余原有或不明来源错误不扩大处理：\n'+repairable.map(f=>`[${f.origin==='new'?'新增':'当前项相关'}] ${f.issue.path||''} ${f.issue.message}`).join('\n').slice(0,6000)
-      options.onProgress?.(`验收未通过，开始第 ${item.repairAttempts}/2 次局部修复`,'working')
+      options.onProgress?.(`验收未通过，开始本轮第 ${item.repairAttempts-repairAttemptsAtStart}/2 次局部修复`,'working')
      }
       item.summary=content.slice(-4000)
       item.outcome=outcome==='complete'&&!denied?'complete':outcome==='needs_input'?'needs_input':'blocked'
@@ -362,7 +377,7 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
       }
     }catch(error){
       const timedOut=workerSignal.reason?.name==='TimeoutError'||failureCode(String(error))==='timeout'
-      item.status='blocked';item.outcome='blocked';item.summary=timedOut?'子任务等待超时，执行历史和恢复点已保留；可继续核对已有结果。\n'+String(error):error instanceof Error?error.message:String(error);item.runtime={status:executionSignal.aborted?'cancelled':'waiting',phase:item.runtime?.phase||'act',waitReason:options.signal.aborted?undefined:stopRequested?'approval':timedOut?'timeout':failureCode(item.summary)==='budget'?'budget':'environment',updatedAt:new Date().toISOString()};if(item.worker)item.worker.finishedAt=new Date().toISOString();save()
+      item.status='blocked';item.outcome='blocked';item.summary=timedOut?'子任务等待超时，执行历史和恢复点已保留；可继续核对已有结果。\n'+String(error):error instanceof Error?error.message:String(error);item.runtime={status:executionSignal.aborted||options.workbench?.isCancelled(item.id)?'cancelled':'waiting',phase:item.runtime?.phase||'act',waitReason:options.signal.aborted?undefined:stopRequested?'approval':timedOut?'timeout':failureCode(item.summary)==='budget'?'budget':'environment',updatedAt:new Date().toISOString()};if(item.worker)item.worker.finishedAt=new Date().toISOString();save()
       if((item.worker||stopRequested)&&!options.signal.aborted)return {status:'blocked',content:`任务停在「${item.title}」，已保存进度。\n\n${item.summary}`}
       throw error
     }
@@ -385,7 +400,7 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
         const admission=fullAccess&&limit>1?workerAdmission(plan,item):{mode:'exclusive' as const,paths:[]}
         if([...active.values()].some(worker=>!canRunTogether(admission,worker.admission)))continue
         attempted.add(item.id)
-        const promise=executeItem(item,admission).then(value=>({id:item.id,value}),error=>({id:item.id,error,rejected:true}))
+        const promise=executeItem(item,admission).then(value=>({id:item.id,value}),error=>({id:item.id,error,rejected:true})).finally(()=>options.workbench?.finishWorker(item.id))
         active.set(item.id,{admission,promise})
       }
       let changed=false
@@ -399,11 +414,11 @@ export async function runTaskPlan(options:ChatRunOptions,execution:PlanExecution
       const result=await Promise.race([...active.values()].map(worker=>worker.promise))
       active.delete(result.id)
       if(result.rejected){
-        if(!stopRequested||options.signal.aborted)throw result.error
+        if((!stopRequested&&!options.workbench?.isCancelled(result.id))||options.signal.aborted)throw result.error
         // A peer may still be repairing its plan metadata when denial arrives.
         const item=plan.items.find(item=>item.id===result.id)!
         item.status='blocked';item.outcome='blocked';item.summary=String(result.error)
-        item.runtime={status:'cancelled',phase:item.runtime?.phase||'plan',waitReason:'approval',updatedAt:new Date().toISOString()}
+        item.runtime={status:'cancelled',phase:item.runtime?.phase||'plan',waitReason:options.workbench?.isCancelled(item.id)?undefined:'approval',updatedAt:new Date().toISOString()}
         if(item.worker)item.worker.finishedAt=new Date().toISOString()
         save();failures.push({status:'blocked',content:`任务停在「${item.title}」，已保存进度。\n\n${item.summary}`})
       }

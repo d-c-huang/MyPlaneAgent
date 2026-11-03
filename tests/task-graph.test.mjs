@@ -163,7 +163,7 @@ test('a write subagent cannot leave its scope through a symbolic link',async t=>
  t.after(()=>fs.rmSync(root,{recursive:true,force:true}))
  fs.mkdirSync(path.join(root,'src'))
  fs.mkdirSync(path.join(root,'outside'))
- fs.symlinkSync(path.join(root,'outside'),path.join(root,'src','alias'))
+ fs.symlinkSync(path.join(root,'outside'),path.join(root,'src','alias'),process.platform==='win32'?'junction':'dir')
  const items=parseTaskItems(JSON.stringify({steps:[{title:'修改源码',acceptance:'源码已更新',mode:'write',fileScope:['src']}]}))
  const f=fixture(items);f.options.workspace=root;f.plan.workspace=root
  await runTaskPlan(f.options,f.execution,async step=>{

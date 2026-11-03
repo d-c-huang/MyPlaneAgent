@@ -7,7 +7,8 @@ import {budgetCapabilities} from './capability-budget.js'
 import {scopeInstruction,scopeExcludes,projectAdviceRequested,type TaskScope} from '../../../shared/task-scope.js'
 import {enqueueReviewActions,nextReviewCheck} from './review-dispatch.js'
 import type {TaskReviewQueue,TaskReviewCheck} from '../../../shared/task-plan.js'
-import {isReadCommand,recoveredReadFailure} from './read-evidence.js'
+import {recoveredReadFailure} from './read-evidence.js'
+import {isReadOnlyCommand} from './read-only-command.js'
 import {needsVisualEvidence} from '../../../shared/visual-review.js'
 import { browserCapabilityNames } from '../../browser-plugin.js'
 import { previewCapabilityNames } from '../static-preview.js'
@@ -15,6 +16,7 @@ import { modelCapacity, ModelContextCapacityError, requestBudget } from '../mode
 import path from 'node:path'
 import os from 'node:os'
 import { createHash, randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import { compactContext, contextMessages, contextStatus, assertContextFits, inferenceBudget,allocateContextBudget,pinnedContext,contextOccupancy,needsCompaction,inCompactionGrowthWindow } from '../../local-ai-context.js'
 import type { ContextCheckpoint, ContextStatus,ContextPinnedState,ContextCompactionReport } from '../../../shared/local-ai-context.js'
 import fs from 'node:fs'
@@ -37,6 +39,7 @@ import {WorkerContextSession} from './worker-context.js'
 import {validateCheckpoint} from '../../context-checkpoint.js'
 
 export type ChatRunOptions = {
+  workbench?:import('./runtime-workbench.js').RuntimeWorkbench
   executionContext?:import('../../../shared/types/capability.js').CapabilityExecutionRequest['execution']
   conversationOnly?:boolean
   readOnlyConversation?:boolean
@@ -58,7 +61,7 @@ export type ChatRunOptions = {
   onVerificationFailure?: (activity:StudioToolActivity)=>void
   beforeMutation?: (capability:Capability,args:Record<string,unknown>)=>Promise<string|undefined>
   beforeExecution?: (capability:Capability,args:Record<string,unknown>)=>string|undefined
-  inspectTool?: (capability:Capability,args:Record<string,unknown>,id:string)=>Promise<Record<string,unknown>>
+  inspectTool?: (capability:Capability,args:Record<string,unknown>,id:string,context?:ChatRunOptions['executionContext'],signal?:AbortSignal)=>Promise<Record<string,unknown>>
   afterExecution?: (capability:Capability,args:Record<string,unknown>,success:boolean)=>void
   planExecution?: import('./task-plan-runner.js').PlanExecution
   connection: AgentConnection; model: string; messages: AgentMessage[]; workspace: string
@@ -84,6 +87,18 @@ const webTools = new Set(['agent.web_search', 'agent.web_fetch'])
 const browserReaders = new Set(['browser.open','browser.read_page'])
 const researchTools = new Set([...webTools,...browserReaders])
 const processes = new Set(['agent.run_command', 'agent.run_test', 'agent.run_test_case', 'agent.build_project', 'agent.get_diagnostics'])
+const editTarget = (workspace:string,file:string) => {
+  const resolved=path.resolve(workspace,file)
+  return process.platform==='win32'?resolved.toLowerCase():resolved
+}
+// A corrected baseline/selector necessarily has different arguments. Only these
+// known precondition failures can be superseded by observed writes to every target.
+function failedEditTargets(workspace:string,failure:StudioToolActivity):string[] {
+  if(failure.status!=='error'||!['agent.replace_text','agent.apply_patch'].includes(failure.capability)||
+    !/待替换片段[^\n]*(?:唯一匹配|实际匹配)|第 \d+ 行匹配[^\n]*重新读取|补丁基线不匹配/.test(failure.output||''))return []
+  const targets=failure.capability==='agent.apply_patch'&&Array.isArray(failure.args.changes)?failure.args.changes.map(change=>change?.path):[failure.args.path]
+  return targets.length&&targets.every(target=>typeof target==='string'&&target.trim())?targets.map(target=>editTarget(workspace,target)):[]
+}
 // Snapshot IDs change on every browser read; they are not evidence of task progress.
 function progressSignature(capability: Capability, args: Record<string, unknown>, output: string): string {
   if(capability.name==='runtime.read_history'){
@@ -127,6 +142,14 @@ function progressSignature(capability: Capability, args: Record<string, unknown>
 /** Conversational Agent Core loop: model calls only capabilities registered by Skills or MCP. */
 export async function runCoreChat(registry: CapabilityRegistry, options: ChatRunOptions): Promise<void> {
   options.signal.throwIfAborted()
+  const requestModel:typeof requestAgentModel=(connection,model,messages,signal,requestOptions={})=>{
+    const withRetry={...requestOptions,onRetry:(notice:import('../model-retry.js').ModelRetryNotice)=>{
+      requestOptions.onRetry?.(notice)
+      options.onRequest()
+      options.onProgress?.(`模型服务暂时不可用，等待 ${Math.ceil(notice.delayMs/1000)} 秒后重试（第 ${notice.attempt}/${notice.maxAttempts} 次请求）`,'working')
+    }}
+    return options.workbench?options.workbench.requestModel(options.executionContext?.itemId||'main',options.executionContext?.workerId,connection,model,messages,signal,withRetry):requestAgentModel(connection,model,messages,signal,withRetry)
+  }
   const editProgress=new EditProgress(options.editProgress)
   editProgress.beginAttempt()
   options={...options,stateContext:(options.stateContext||'')+'\n宿主机当前时间：'+JSON.stringify({utc:new Date().toISOString(),timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,local:new Date().toLocaleString('zh-CN')})+'。相对日期按用户所在地区时区换算；缺少地区时不推定其法定工作日。'}
@@ -183,6 +206,8 @@ export async function runCoreChat(registry: CapabilityRegistry, options: ChatRun
   capabilities=budgetCapabilities(capabilities,query,modelCapacity(options.connection,options.model),implementationStep)
   capabilities=retainReadbackTools(capabilities,registry.list().filter(cap=>chatCapabilityAllowed(cap,options)))
   const selectedToolNames=new Set(capabilities.map(capability=>capability.name))
+  const configuredVersion=()=>options.workbench?String(options.workbench.configuration('main').revision)+':'+options.workbench.configuration(options.executionContext?.itemId||'main').revision:''
+  let selectedConfiguration=configuredVersion()
   const admit=typeof registry.admit==='function'?(capability:Capability)=>registry.admit(capability):undefined
   let toolSurface=createToolSurface(capabilities,admit)
   capabilities=toolSurface.capabilities
@@ -271,7 +296,7 @@ export async function runCoreChat(registry: CapabilityRegistry, options: ChatRun
       onCompaction:report=>{if(report.outcome!=='unchanged'||report.requests)lastCompaction=report},
       summarize: async (input, maxTokens, observer) => {
         options.onRequest()
-        const answer = await requestAgentModel({ ...connection, maxTokens }, options.model, input as AgentMessage[], options.signal,
+        const answer = await requestModel({ ...connection, maxTokens }, options.model, input as AgentMessage[], options.signal,
           { tools: false, summary: true, onUsage:usage=>{observer.onUsage(usage);options.onUsage(usage)} })
         return answer.content || ''
       }
@@ -316,10 +341,13 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
   let searchAttempted=false,searchEntryCorrections=0
   let duplicateSearches = 0
   let searchPaused = false
+  let pausedSearchRequests = 0
   let searchPauseNotice:AgentMessage|undefined
   let lastToolError = ''
   const unresolvedFailures = new Set<string>()
   const failureDetails=new Map<string,StudioToolActivity[]>()
+  const recoveredEditPaths=new Map<string,Set<string>>()
+  const recoveredFailures=new Map<string,string>()
   let outputRecovery = false
   const failedPageUrls=new Set<string>()
   const screenshotFallbackAttempts=new Set<string>()
@@ -363,6 +391,7 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
       if (!system.includes(continuationInstruction)) system.push(continuationInstruction)
       options.onProgress?.(`已处理 ${round} 轮，已有新的执行结果，正在继续处理剩余步骤`, 'working')
     }
+    if(selectedConfiguration!==configuredVersion()){for(const capability of registry.list())if(chatCapabilityAllowed(capability,options))selectedToolNames.add(capability.name);selectedConfiguration=configuredVersion()}
     const current=registry.list().filter(capability=>selectedToolNames.has(capability.name)&&chatCapabilityAllowed(capability,options))
     const fresh=createToolSurface(retainReadbackTools(budgetCapabilities(current,query,modelCapacity(options.connection,options.model),implementationStep),current),admit)
     if(fresh.fingerprint!==toolSurface.fingerprint){
@@ -409,7 +438,7 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
      options.signal.throwIfAborted()
      options.onRequest()
      streamedContent = ''; streamedReasoning = ''
-     try { response = await requestAgentModel(connection, options.model, retryInput, options.signal, {
+     try { response = await requestModel(connection, options.model, retryInput, options.signal, {
       tools: denied || synthesizeFromEvidence ? false : turnTools, thinking: false, temperature: adapted?.temperature ?? options.temperature,
       onContent: text => { streamedContent += text }, onReasoning: text => { streamedReasoning += text }, onUsage: options.onUsage
      }); break } catch (error) {
@@ -453,7 +482,15 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
       throw error
     }
     if (!response) throw new Error('模型未返回有效响应')
-    if(synthesizeFromEvidence&&response.tool_calls?.length){pause('连续 6 轮没有新证据，已要求依据现有资料作答，但模型仍请求工具调用。');return}
+    if(synthesizeFromEvidence&&response.tool_calls?.length){pause('工具调用未取得新证据，已要求依据现有资料作答，但模型仍请求工具调用。');return}
+    // Some providers return the canonical name from the description. Accept only
+    // an exact name of an advertised tool, before persisting assistant history.
+    const advertisedNames=new Set(turnTools.map(tool=>tool.function.name))
+    const canonicalAliases=new Map(turnTools.map(tool=>[aliases.get(tool.function.name)?.name,tool.function.name]))
+    for(const call of response.tool_calls||[]){
+      const alias=canonicalAliases.get(call.function.name)
+      if(alias)call.function.name=alias
+    }
     if (outputRecovery && (response.tool_calls?.length || 0) > 1) {
       options.onProgress?.(`恢复模式收到 ${response.tool_calls!.length} 个完整调用，正在逐个校验并顺序处理`, 'working')
     }
@@ -529,7 +566,7 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
             args:Object.fromEntries(Object.entries(activity.args||{}).filter(([key])=>['path','target','url','query','command','startLine','endLine','runner','timeoutSeconds'].includes(key)).slice(0,8).map(([key,value])=>[key,excerpt(value,180)])),
             output:excerpt(activity.output,limit)
           })
-          const failures=reviewActivities.filter(activity=>activity.status!=='complete')
+          const failures=reviewActivities.filter(activity=>activity.status!=='complete'&&!recoveredFailures.has(activity.id))
           const successes=reviewActivities.filter(activity=>activity.status==='complete')
           const selectedLimit=attempt===0?24:8,failedLimit=attempt===0?12:6
           const selected=new Map<string,StudioToolActivity>()
@@ -549,6 +586,7 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
             failedOrDeniedEvidence:failures.slice(-failedLimit).map(activity=>describe(activity,attempt===0?650:400)),
             omittedFailedOrDeniedActivities:Math.max(0,failures.length-failedLimit),
             unresolvedFailures:[...unresolvedFailures],denied,
+            recoveredFailures:[...recoveredFailures].slice(-12).map(([activityId,resolvedBy])=>({activityId,resolvedBy})),
             reviewChecks:reviewQueue.checks.slice(-(attempt===0?12:6)).map(check=>({title:check.title,status:check.status,attempts:check.attempts,summary:excerpt(check.summary,attempt===0?360:180)})),
             sourceReadEvidence:[...sourceReadEvidence].slice(-(attempt===0?24:12)),
             note:'上述为原始工具执行记录的摘录，省略的输出仍保存在执行记录。候选回答中的自述不能代替成功工具证据；若必要证据因摘录不足无法确认，请用 continue 或 needs_input，不可推断为 complete。'
@@ -558,7 +596,7 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
         }else reviewInput=await prepare([instruction,reviewRequest])
         options.onRequest()
         try {
-          const answer = await requestAgentModel(connection, options.model, [...reviewInput, instruction,reviewRequest], options.signal,
+          const answer = await requestModel(connection, options.model, [...reviewInput, instruction,reviewRequest], options.signal,
             { tools: false, thinking: false, temperature: 0, onUsage: options.onUsage })
           review = parseCompletionReview(answer.content || '')
         } catch (error) {
@@ -596,6 +634,7 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
       if(review.status==='complete'&&review.missingEvidence?.length)review={...review,status:'continue',reason:'验收仍有缺失证据：'+review.missingEvidence.join('；'),nextStep:review.nextStep||'补齐列出的验收证据后重新核验。'}
       if(review.status==='complete'&&unreadablePagePending)review={status:'needs_input',reason:'网页正文未能读取，当前没有可供模型核对的页面文字或截图分析结果。',nextStep:'请查看已保存的截图，或切换支持图片识别的模型后继续；也可提供其他可读取的来源。',missingEvidence:['网页内容证据']}
       if(visualRequired&&!userConfirmed&&review.status==='complete'&&(!visualSupported||!visualEvidenceFresh))review={status:'continue',reason:'尚无可供当前模型核验的本项最新画面；文件、源码、canvas 尺寸通过不能替代视觉验收。',nextStep:'切换到验收要求的视角并截图核验。',missingEvidence:['本项实际画面的视觉证据']}
+      if(review.status==='complete'&&(unresolvedFailures.size||pendingEffects.size))review={...review,status:'blocked',reason:pendingEffects.size?'仍有执行结果未知的操作，需要先核对实际副作用。':'仍有未解决的工具错误，尚不能确认任务完成。',nextStep:review.nextStep||'根据已保存的执行记录核对失败或未知结果，选择可用的修复步骤；不要重复已成功的操作。'}
       if((review.status==='continue'||review.status==='needs_input'||review.status==='blocked'&&unresolvedFailures.size>0)&&review.actions?.some(action=>action.required)&&!denied){
         const rejected=enqueueReviewActions(reviewQueue,review.actions,options.taskScope,action=>{const cap=capabilities.find(cap=>cap.name===action.capability);if(!cap)return '本轮未提供该能力';try{validateToolArguments(cap.parameters,action.args)}catch(error){return String(error)}return undefined})
         options.onReviewQueue?.()
@@ -656,13 +695,28 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
       options.signal.throwIfAborted()
       if(options.maxToolCalls!==undefined&&succeeded+failed>=options.maxToolCalls){pause(`工具调用已达到设置的上限（本轮 ${succeeded+failed}/${options.maxToolCalls} 次），调整预算后可继续。`);return}
       const capability = aliases.get(call.function.name)
-      if (!capability || !chatCapabilityAllowed(capability, options)||reviewQueue.phase==='implement'&&reviewQueue.implementationRecovery&&(browserCapabilityNames.has(capability.name)||previewCapabilityNames.has(capability.name))||searchPaused&&capability.name==='agent.web_search') {
+      if (capability?.name==='agent.web_search'&&chatCapabilityAllowed(capability,options)&&searchPaused) {
+        failed++
+        pausedSearchRequests++
+        const output='搜索未执行：连续搜索返回相同资料，应用已暂时暂停搜索。请读取已有结果中与任务相关的来源，或根据现有证据回答；资料不足时说明缺少的信息。读取来源取得新证据后会恢复搜索。'
+        options.onActivity({id:randomUUID(),capability:capability.name,args:{},status:'error',output})
+        history.push({role:'tool',tool_call_id:call.id,content:JSON.stringify({status:'notApplied',reason:'duplicate-search-results',output})})
+        saveContext()
+        if(pausedSearchRequests>=2&&!synthesisAttempted){
+          synthesisAttempted=true
+          synthesizeFromEvidence=true
+          system.push({role:'system',content:'搜索因结果重复而暂停后，仍连续请求搜索。本轮工具已收起，请根据已取得的证据直接回答。若现有资料与任务无关或不足以继续，明确说明缺少的关键资料并向用户澄清，不能编造结果或宣称任务完成。'})
+          options.onProgress?.('搜索结果重复，正在整理已有证据及缺失信息','working')
+        }
+        continue
+      }
+      if (!capability || !advertisedNames.has(call.function.name)||!chatCapabilityAllowed(capability, options)||reviewQueue.phase==='implement'&&reviewQueue.implementationRecovery&&(browserCapabilityNames.has(capability.name)||previewCapabilityNames.has(capability.name))) {
         failed++
         invalidToolName = call.function.name
         unresolvedFailures.add('__invalid_tool__')
         const output = `工具未执行：${JSON.stringify(call.function.name)} 不在本轮可用工具列表中。请逐字使用 tools 中的 function.name，并遵守当前权限；若没有对应工具，请说明限制。`
         options.onActivity({ id: randomUUID(), capability: call.function.name, args: {}, status: 'error', output })
-        history.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ status: 'error', output }) })
+        history.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ status: 'error', notApplied:true, output,availableTools:turnTools.map(tool=>({name:tool.function.name,capability:aliases.get(tool.function.name)?.name})) }) })
         saveContext()
         continue
       }
@@ -672,7 +726,7 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
       try {
         args = JSON.parse(call.function.arguments) as Record<string, unknown>
         if(options.inspectTool){
-          args=await options.inspectTool(capability,args,activityId)
+          args=await options.inspectTool(capability,args,activityId,options.executionContext,options.signal)
           options.signal.throwIfAborted()
           call.function.arguments=JSON.stringify(args)
         }
@@ -725,7 +779,7 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
         if(call.id.startsWith('experience-')&&experienceFlow&&!experienceFlow.isCurrent()){
           experienceFlow.fail('流程已停用、修改或过期','changed');options.onOutcome?.('blocked');options.onContent('所采用的经验流程已变化，未执行后续步骤。请重新发送任务。');return
         }
-        if(textEditTools.has(capability.name)||['agent.run_command','agent.create_document','agent.replace_document_text','agent.create_spreadsheet','agent.update_spreadsheet_cells'].includes(capability.name)&&!isReadCommand(capability.name,args)){
+        if(textEditTools.has(capability.name)||['agent.run_command','agent.create_document','agent.replace_document_text','agent.create_spreadsheet','agent.update_spreadsheet_cells'].includes(capability.name)&&!isReadOnlyCommand(capability.name,args)){
           const blocked=await options.beforeMutation?.(capability,args)
           options.signal.throwIfAborted()
           if(blocked){activity.status='error';activity.output=blocked;options.onActivity({...activity});options.onOutcome?.('blocked');options.onContent(blocked);return}
@@ -743,10 +797,12 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
         activity.status = 'running'; options.onActivity({ ...activity })
         const snapshot=prepareChatFileChanges(options.workspace,capability.name,args)
         durable?.beginTool(call.id,activity,history,checkpoint)
-        const execute=()=>registry.execute({ capability: capability.name, args, workspace: options.workspace,admission:toolSurface.admissions.get(capability.name),
+        const execute=async():Promise<import('../../../shared/types/capability.js').CapabilityExecutionResult>=>{
+          if(options.workbench&&!options.workbench.allows(options.executionContext?.itemId||'main',capability.name))return {success:false,outcome:'failed',failureCode:'conflict',admissionRejected:true,error:'节点配置已禁用此工具，调用未执行：'+capability.name,elapsedMs:0}
+          return registry.execute({ capability: capability.name, args, workspace: options.workspace,admission:toolSurface.admissions.get(capability.name),
           execution:{...options.executionContext,taskId:options.executionContext?.taskId||'conversation',activityId:activity.id},
           context: { allowExternalPaths: (options.getApprovalMode?.() ?? options.approvalMode) === 'full' || externalPath(args, options.workspace),historyMaxChars:Math.max(256,Math.min(6000,Math.floor(connection.contextLength*.12))),historyMaxTokens:toolResultContextBudget(connection.contextLength) }
-        }, options.signal)
+        }, options.signal)}
         let result:Awaited<ReturnType<typeof execute>>
         if(snapshot?.paths.length){
           const recorded=await withLocalGitHistory(options.workspace,snapshot.paths,async()=>{
@@ -800,15 +856,28 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
       if (activity.status === 'complete') {
         succeeded++
         const previousFailures=failureDetails.get(capability.name)||[]
-        const argumentKey=(value:Record<string,unknown>)=>JSON.stringify(value,Object.keys(value).sort())
-        const remainingFailures=previousFailures.filter(failure=>argumentKey(failure.args)!==argumentKey(args))
+        const remainingFailures=previousFailures.filter(failure=>{
+          if(pendingEffects.has(failure.id)||failedEditTargets(options.workspace,failure).length||!isDeepStrictEqual(failure.args,args))return true
+          recoveredFailures.set(failure.id,activity.id)
+          return false
+        })
         if(remainingFailures.length)failureDetails.set(capability.name,remainingFailures)
         else{unresolvedFailures.delete(capability.name);failureDetails.delete(capability.name)}
         for(const [name,failures] of failureDetails){
-          const remaining=failures.filter(failure=>!recoveredReadFailure(options.workspace,failure,activity,/根目录|项目结构|项目类型|入口文件|确认.*入口/.test(query)))
+          const changedPaths=new Set(textEditTools.has(activity.capability)?(activity.fileChanges||[]).filter(change=>change.before!==change.after).map(change=>editTarget(options.workspace,change.path)):[])
+          const remaining=failures.filter(failure=>{
+            if(pendingEffects.has(failure.id))return true
+            const targets=failedEditTargets(options.workspace,failure)
+            const recoveredPaths=recoveredEditPaths.get(failure.id)||new Set<string>()
+            for(const target of targets)if(changedPaths.has(target))recoveredPaths.add(target)
+            if(recoveredPaths.size)recoveredEditPaths.set(failure.id,recoveredPaths)
+            const recovered=targets.length>0&&targets.every(target=>recoveredPaths.has(target))||recoveredReadFailure(options.workspace,failure,activity,/根目录|项目结构|项目类型|入口文件|确认.*入口/.test(query))
+            if(recovered){recoveredFailures.set(failure.id,activity.id);recoveredEditPaths.delete(failure.id)}
+            return !recovered
+          })
           if(remaining.length===failures.length)continue
           if(remaining.length)failureDetails.set(name,remaining);else{failureDetails.delete(name);unresolvedFailures.delete(name)}
-          options.onProgress?.('已通过替代读取取得同文件源码线索，保留原失败记录并继续核验：'+name,'reviewing')
+          options.onProgress?.('已取得对应目标的成功执行证据，保留原失败记录并继续核验：'+name,'reviewing')
         }
         if(capability.name==='agent.web_fetch'){
           failedPageUrls.delete(pageKey(args.url))
@@ -839,7 +908,7 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
             options.onProgress?.('搜索结果重复，正在改为读取来源网页','working')
           }
         }else if((capability.name==='agent.web_fetch'||capability.name==='browser.read_page')&&!evidence.has(signature)){
-          searchPaused=false;duplicateSearches=0
+          searchPaused=false;duplicateSearches=0;pausedSearchRequests=0
           if(searchPauseNotice){system.splice(system.indexOf(searchPauseNotice),1);searchPauseNotice=undefined}
         }
         if (!ineffectiveEdit&&!evidence.has(signature)) { evidence.add(signature); roundProgress = true; segmentProgress = true; continuations = 0 }
@@ -889,7 +958,8 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
         if(!experienceFlow.finished&&experienceFlow.reason)options.onProgress?.(experienceFlow.reason,'working')
         if(experienceFlow.finished)options.onProgress?.((experienceFlow.passed?'经验流程本次检查通过：':'经验流程本次检查未通过：')+experienceFlow.reason,'working')
       }
-      history.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ activityId:activity.id,status: activity.status, capability: activity.capability, output: activity.output || '',...(admissionRejected?{notApplied:true,reason:'tool-admission-changed'}:{}) }) })
+      const resolvedFailureIds=[...recoveredFailures].filter(([,resolvedBy])=>resolvedBy===activity.id).map(([id])=>id)
+      history.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ activityId:activity.id,status: activity.status, capability: activity.capability, output: activity.output || '',...(resolvedFailureIds.length?{resolvedFailureIds}:{}),...(admissionRejected?{notApplied:true,reason:'tool-admission-changed'}:{}) }) })
       durable?.finishTool(activity,history,checkpoint,[...pendingEffects.values()])
       if(durable)durable.publish(options.onActivity);else options.onActivity({...activity})
       saveContext()
@@ -907,6 +977,7 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
       const screenshot=capabilities.find(cap=>cap.source.type==='builtin'&&cap.name==='browser.screenshot'&&chatCapabilityAllowed(cap,options))
       if(screenshot){
         const args={url:emptyPageUrl},activity:StudioToolActivity={id:randomUUID(),capability:screenshot.name,args,status:'running'}
+        if(options.inspectTool){const schema={allOf:[screenshot.parameters,{type:'object',properties:{url:{const:emptyPageUrl}},required:['url'],additionalProperties:false}]};await options.inspectTool({...screenshot,parameters:schema},args,activity.id,options.executionContext,options.signal);options.signal.throwIfAborted()}
         options.onProgress?.('网页正文为空，正在截取当前页面以核对可见内容','working')
         let approved=!chatApprovalRequired(screenshot,args,options)||options.approvalGranted?.(activity)===true
         if(!approved){activity.status='waiting';options.onActivity({...activity});approved=await options.approve({...activity});options.approvalMode=options.getApprovalMode?.()??options.approvalMode}
@@ -916,6 +987,7 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
         try{
           const replayBlock=options.beforeExecution?.(screenshot,args)
           if(replayBlock)throw new Error(replayBlock)
+          options.workbench?.assertAllowed(options.executionContext?.itemId||'main',screenshot.name)
           const result=await registry.execute({capability:screenshot.name,args,workspace:options.workspace,admission:toolSurface.admissions.get(screenshot.name),execution:{...options.executionContext,taskId:options.executionContext?.taskId||'conversation',activityId:activity.id},context:{allowExternalPaths:options.approvalMode==='full'}},options.signal)
           options.afterExecution?.(screenshot,args,result.success)
           options.signal.throwIfAborted()
@@ -936,8 +1008,10 @@ ${browserEvidenceContext()} 不要提出本轮不存在的工具。继续必须�
               temporaryDirectory=await fs.promises.mkdtemp(path.join(os.tmpdir(),'myplane-page-ocr-'))
               await fs.promises.writeFile(path.join(temporaryDirectory,'page.jpg'),Buffer.from(image.dataUrl.slice('data:image/jpeg;base64,'.length),'base64'),{mode:0o600})
               const ocrArgs={path:'page.jpg'}
+              if(options.inspectTool){const schema={allOf:[ocr.parameters,{type:'object',properties:{path:{const:'page.jpg'}},required:['path'],additionalProperties:false}]};await options.inspectTool({...ocr,parameters:schema},ocrArgs,ocrActivity.id,options.executionContext,options.signal);options.signal.throwIfAborted()}
               const replayBlock=options.beforeExecution?.(ocr,ocrArgs)
               if(replayBlock)throw new Error(replayBlock)
+              options.workbench?.assertAllowed(options.executionContext?.itemId||'main',ocr.name)
               const recognized=await registry.execute({capability:ocr.name,args:ocrArgs,workspace:temporaryDirectory,admission:ocrSurface.admissions.get(ocr.name),execution:{...options.executionContext,taskId:options.executionContext?.taskId||'conversation',workspace:options.workspace,activityId:ocrActivity.id,parentEvidenceId:activity.id}},options.signal)
               options.afterExecution?.(ocr,ocrArgs,recognized.success)
               options.signal.throwIfAborted()

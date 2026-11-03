@@ -43,7 +43,7 @@ const messageUsage=(message:StudioMessage)=>message.usage||readTokenUsage({usage
      </details>
      <div v-if="active(index)" class="live-status" role="status"><span class="flow-indicator running"></span>{{liveLabel(message)}}<span v-if="!entries.length">已处理 {{liveElapsed(message)}}</span></div>
      <ChatArtifactList v-if="artifacts.length" :artifacts="artifacts" @open="$emit('open-artifact',$event)"/>
-     <section v-if="message.content" class="final-answer"><h3 v-if="entries.length">{{outcomeLabel(message)}}</h3><AiMarkdown :text="message.content"/></section>
+     <section v-if="message.content" class="final-answer"><AiMarkdown :text="message.content"/></section>
      <div v-if="message.status==='error'" class="execution-error" role="alert"><strong>本次执行未完成</strong><p>{{message.error||'生成未完成，可以重试。'}}</p></div>
      <p v-else-if="message.status==='stopped'" class="quiet">已停止生成，已执行的操作记录保留。</p>
      <footer v-if="!active(index)" class="answer-meta"><span v-if="!entries.length&&message.elapsedMs!==undefined">{{formatElapsedTime(message.elapsedMs)}}</span><TokenUsageDisplay :usage="message.usageTotals??sumTokenUsage([messageUsage(message)])" :requests-known="!!message.usageTotals" label="本次 Tokens" compact/></footer>

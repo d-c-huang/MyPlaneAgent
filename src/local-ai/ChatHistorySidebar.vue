@@ -6,7 +6,7 @@ import ChatHistoryRow from './ChatHistoryRow.vue'
 const props=defineProps<{studio:ReturnType<typeof useLocalAiStudio>}>()
 const emit=defineEmits<{open:[id:string]}>()
 const ch=reactive(props.studio)
-const locked=computed(()=>ch.sending||ch.sessionBusy)
+const locked=computed(()=>ch.sessionBusy||ch.selectingChatModel)
 const storageKey='myplane.chat-sidebar.sections'
 function savedSections(){try{return JSON.parse(localStorage.getItem(storageKey)||'{}')}catch{return {}}}
 const saved=savedSections()
@@ -28,7 +28,7 @@ async function newProjectSession(projectId:string){projectOpen[projectId]=true;a
   <section class="history-section">
    <header><button class="section-toggle" :aria-expanded="visible('pinned')" aria-controls="pinned-chats" @click="toggle('pinned')"><span>置顶</span><ArrowRight :class="{expanded:visible('pinned')}"/></button></header>
    <div v-show="visible('pinned')" id="pinned-chats">
-    <ChatHistoryRow v-for="item in pinned" :key="item.id" :item="item" :selected="item.id===ch.session?.id" :disabled="locked" :projects="ch.chatProjects" @open="emit('open',$event)" @pin="ch.organizeSession($event,{pinned:!$event.pinned})" @move="(item,projectId)=>ch.organizeSession(item,{projectId})" @rename="ch.renameSession" @delete="ch.deleteSession"/>
+    <ChatHistoryRow v-for="item in pinned" :key="item.id" :item="item" :selected="item.id===ch.session?.id" :disabled="locked" :run-state="ch.sessionRunState(item.id)" :projects="ch.chatProjects" @open="emit('open',$event)" @pin="ch.organizeSession($event,{pinned:!$event.pinned})" @move="(item,projectId)=>ch.organizeSession(item,{projectId})" @rename="ch.renameSession" @delete="ch.deleteSession"/>
     <p v-if="!pinned.length" class="section-empty">{{query?'没有匹配的置顶会话':'暂无置顶会话'}}</p>
    </div>
   </section>
@@ -38,7 +38,7 @@ async function newProjectSession(projectId:string){projectOpen[projectId]=true;a
     <div v-for="project in projects" :key="project.id" class="project-group">
      <div class="project-heading"><button class="project-toggle" :title="project.workspace" :aria-expanded="projectOpen[project.id]!==false||!!query" @click="projectOpen[project.id]=projectOpen[project.id]===false"><FolderOpened/><span>{{project.name}}</span><ArrowRight class="project-chevron" :class="{expanded:projectOpen[project.id]!==false||!!query}"/></button><button class="icon-button project-new" :aria-label="`在${project.name}中新建会话`" title="新建项目会话" :disabled="locked" @click="newProjectSession(project.id)"><Plus/></button></div>
      <div v-show="projectOpen[project.id]!==false||!!query" class="project-sessions">
-      <ChatHistoryRow v-for="item in project.sessions" :key="item.id" :item="item" :selected="item.id===ch.session?.id" :disabled="locked" :projects="ch.chatProjects" @open="emit('open',$event)" @pin="ch.organizeSession($event,{pinned:!$event.pinned})" @move="(item,projectId)=>ch.organizeSession(item,{projectId})" @rename="ch.renameSession" @delete="ch.deleteSession"/>
+      <ChatHistoryRow v-for="item in project.sessions" :key="item.id" :item="item" :selected="item.id===ch.session?.id" :disabled="locked" :run-state="ch.sessionRunState(item.id)" :projects="ch.chatProjects" @open="emit('open',$event)" @pin="ch.organizeSession($event,{pinned:!$event.pinned})" @move="(item,projectId)=>ch.organizeSession(item,{projectId})" @rename="ch.renameSession" @delete="ch.deleteSession"/>
       <p v-if="!project.sessions.length" class="section-empty">暂无会话</p>
      </div>
     </div>
@@ -48,7 +48,7 @@ async function newProjectSession(projectId:string){projectOpen[projectId]=true;a
   <section class="history-section">
    <header><button class="section-toggle" :aria-expanded="visible('recent')" aria-controls="recent-chats" @click="toggle('recent')"><span>最近</span><ArrowRight :class="{expanded:visible('recent')}"/></button></header>
    <div v-show="visible('recent')" id="recent-chats">
-    <ChatHistoryRow v-for="item in recent" :key="item.id" :item="item" :selected="item.id===ch.session?.id" :disabled="locked" :projects="ch.chatProjects" @open="emit('open',$event)" @pin="ch.organizeSession($event,{pinned:!$event.pinned})" @move="(item,projectId)=>ch.organizeSession(item,{projectId})" @rename="ch.renameSession" @delete="ch.deleteSession"/>
+    <ChatHistoryRow v-for="item in recent" :key="item.id" :item="item" :selected="item.id===ch.session?.id" :disabled="locked" :run-state="ch.sessionRunState(item.id)" :projects="ch.chatProjects" @open="emit('open',$event)" @pin="ch.organizeSession($event,{pinned:!$event.pinned})" @move="(item,projectId)=>ch.organizeSession(item,{projectId})" @rename="ch.renameSession" @delete="ch.deleteSession"/>
     <p v-if="!recent.length" class="section-empty">{{query?'没有匹配的会话':'暂无最近会话'}}</p>
    </div>
   </section>

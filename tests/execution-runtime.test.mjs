@@ -12,6 +12,9 @@ import {inspectTextEdit} from '../dist-electron/main/agent/core/edit-progress.js
 
 const cap=name=>({name,category:'agent',runtime:'python-native',source:{type:'skill',skillId:'agent-tools'},permissions:[],parameters:{type:'object'}})
 const signal=()=>new AbortController().signal
+// Directory junctions exercise canonical-path boundaries on Windows without
+// requiring the symlink privilege or changing the machine's developer settings.
+const directoryLink=(target,link)=>fs.symlinkSync(target,link,process.platform==='win32'?'junction':'dir')
 function fixture(t){
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'myplane-runtime-')),workspace=path.join(root,'workspace'),directory=path.join(root,'data')
  fs.mkdirSync(workspace)
@@ -64,8 +67,8 @@ test('automatic worker budgets keep counting beyond legacy caps and preserve evi
  assert.equal(calls,2);assert.equal(budget.used,82);assert.equal(budget.limit,undefined)
 })
 test('symlink paths share the workspace lock and cannot escape inherited scopes',async t=>{
- const f=fixture(t),alias=path.join(f.root,'alias');fs.symlinkSync(f.workspace,alias,'dir')
- fs.symlinkSync(f.root,path.join(f.workspace,'outside'),'dir')
+ const f=fixture(t),alias=path.join(f.root,'alias');directoryLink(f.workspace,alias)
+ directoryLink(f.root,path.join(f.workspace,'outside'))
  const escaped=f.request('agent.write_file',{path:'outside/escape.txt',content:'no'})
  escaped.execution.writeScopes=[['.']]
  assert.equal((await f.runtime.execute(cap(escaped.capability),escaped,signal(),async()=>assert.fail())).failureCode,'permission')
@@ -159,15 +162,15 @@ test('repeated checks keep source evidence current and detect concurrent source 
 test('queued writes recheck file scopes and workspace aliases before invoking tools',async t=>{
  for(const scenario of ['scope','workspace']){
   const f=fixture(t),alias=path.join(f.root,'alias'),allowed=path.join(f.workspace,'allowed'),outside=path.join(f.root,'outside')
-  fs.mkdirSync(allowed);fs.mkdirSync(outside);fs.symlinkSync(f.workspace,alias,'dir')
+  fs.mkdirSync(allowed);fs.mkdirSync(outside);directoryLink(f.workspace,alias)
   let unblock;const hold=new Promise(resolve=>unblock=resolve)
   const first=f.runtime.execute(cap('agent.run_test'),f.request('agent.run_test',{},'hold'),signal(),async()=>{await hold;return {success:true,output:{exitCode:0},elapsedMs:0}})
   const request=f.request('agent.write_file',{path:'allowed/result.txt',content:'x'},'queued')
   request.workspace=alias;request.execution.writeScopes=[['allowed']]
   const second=f.runtime.execute(cap(request.capability),request,signal(),async()=>assert.fail('changed paths must not be invoked'))
   await new Promise(resolve=>setImmediate(resolve))
-  if(scenario==='scope'){fs.rmdirSync(allowed);fs.symlinkSync(outside,allowed,'dir')}
-  else{fs.unlinkSync(alias);fs.symlinkSync(outside,alias,'dir')}
+  if(scenario==='scope'){fs.rmdirSync(allowed);directoryLink(outside,allowed)}
+  else{fs.unlinkSync(alias);directoryLink(outside,alias)}
   unblock();await first
   assert.equal((await second).failureCode,'conflict')
  }

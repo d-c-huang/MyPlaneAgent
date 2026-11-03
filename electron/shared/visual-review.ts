@@ -2,13 +2,22 @@ import type {StudioMessage, StudioToolActivity} from './local-ai-studio.js'
 import type {TaskItem, TaskPlan} from './task-plan.js'
 
 export type VisualDecision = {itemId:string;activityId:string;imageHash:string;decision:'accept'|'reject'|'recapture';note?:string}
-export const needsVisualEvidence=(text:string)=>/视觉|画面|外观|正面视角|(?:canvas|3D).*渲染/i.test(text)
+const visualRequirement=/视觉|画面|外观|正面视角|(?:canvas|3D).*渲染/i
+// Only a whole, explicitly excluded verification clause can waive this gate.
+// Unknown wording and affirmative appearance criteria stay conservative; a
+// negation about one check cannot erase another clause's visual requirement.
+const excludedVisualCheck=/^(?:(?:本项|本次|本轮|此项|当前任务|该任务)(?:验收)?[：:\s]*)?(?:不要求|不需要|无需|无须|不必|不做|不进行)(?:额外|另行|专项|再|进行|执行|提供|取得|人工|人眼|查看|截图|图像|图片|视觉|画面|外观|正面视角|canvas|3D|模型|场景|渲染|效果|质量|证据|检查|核验|验收|验证|确认|评审|的|以及|及|和|与|或|也不要求|也不需要|[、/\s])+$/i
+function requiredVisualText(text:string):string{
+ const required=text.split(/[，,。；;!?！？\n]|但是|不过|然而|但|同时|并且|而且/).filter(clause=>!excludedVisualCheck.test(clause.trim()))
+ return required.join('；')
+}
+export const needsVisualEvidence=(text:string)=>visualRequirement.test(requiredVisualText(text))
 export function visualReviewQuestion(item:TaskItem):string|undefined{
  if(needsVisualEvidence(item.acceptance))return item.acceptance
  // Overall acceptance is generic; the reviewer can discover a visual gap later.
  // This is a request for visual confirmation, never completion of other checks.
  if(item.completionReview?.missingEvidence?.some(needsVisualEvidence))return '请查看截图，确认画面渲染是否符合本项要求。'
- const nextStep=item.completionReview?.nextStep||''
+ const nextStep=requiredVisualText(item.completionReview?.nextStep||'')
  if(/截图/.test(nextStep)&&/查看|确认|核验/.test(nextStep))return '请查看截图，确认画面是否符合本项要求。'
 }
 export function invalidatesVisualEvidence(activity:StudioToolActivity){

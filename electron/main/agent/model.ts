@@ -7,6 +7,7 @@ import type {AgentModelProgress} from '../../shared/local-ai-agent.js'
 import type {ToolDefinition} from './registry.js'
 import {ModelOutputLimitError,ModelResponseSizeError} from '../local-ai-model-error.js'
 import type {RemoteApiFormat} from '../../shared/local-ai.js'
+import {ModelRequestError,modelRetryAfter,retryModelRequest,type ModelRetryNotice} from './model-retry.js'
 export {ModelOutputLimitError} from '../local-ai-model-error.js'
 export {ModelResponseSizeError} from '../local-ai-model-error.js'
 export type ToolCall={id:string;type:'function';function:{name:string;arguments:string}}
@@ -15,7 +16,7 @@ export type AgentAnswer=Omit<AgentMessage,'content'>&{content:string|null;reason
 export type AgentConnection={endpoint:string;key:string;maxTokens:number;contextLength:number;localLlama?:boolean;apiFormat?:RemoteApiFormat}
 export class ModelFormatError extends Error {constructor(message:string){super(message);this.name='ModelFormatError'}}
 export const agentModelTiming={firstResponseMs:10*60*1000,idleMs:5*60*1000,totalMs:30*60*1000}
-type RequestOptions={temperature?:number;onResponse?:(text:string)=>void;tools?:false|ToolDefinition[];summary?:boolean;thinking?:boolean;onContent?:(text:string)=>void;onReasoning?:(text:string)=>void;onUsage?:(usage:TokenUsage)=>void;onProgress?:(progress:Pick<AgentModelProgress,'phase'|'characters'|'toolNames'>)=>void;timing?:Partial<typeof agentModelTiming>}
+type RequestOptions={temperature?:number;onResponse?:(text:string)=>void;tools?:false|ToolDefinition[];summary?:boolean;thinking?:boolean;onContent?:(text:string)=>void;onReasoning?:(text:string)=>void;onUsage?:(usage:TokenUsage)=>void;onProgress?:(progress:Pick<AgentModelProgress,'phase'|'characters'|'toolNames'>)=>void;onRetry?:(notice:ModelRetryNotice)=>void;timing?:Partial<typeof agentModelTiming>}
 const llamaGrammarOnlyKeywords=new Set(['minLength','maxLength','minimum','maximum','exclusiveMinimum','exclusiveMaximum','multipleOf','minItems','maxItems','minProperties','maxProperties','pattern'])
 function llamaSchema(value:unknown):unknown{
  if(Array.isArray(value))return value.map(llamaSchema)
@@ -75,8 +76,16 @@ export async function requestAgentModel(connection:AgentConnection,model:string,
   messages = [{role:'system',content}, ...messages.filter(message => message.role !== 'system')]
  }
 
+ let receivedOutput=false
+ const attemptOptions:RequestOptions={...options,
+  onContent:text=>{if(text)receivedOutput=true;options.onContent?.(text)},
+  onReasoning:text=>{if(text)receivedOutput=true;options.onReasoning?.(text)},
+  onUsage:usage=>{receivedOutput=true;options.onUsage?.(usage)},
+  onProgress:progress=>{if(progress.characters>0)receivedOutput=true;options.onProgress?.(progress)}
+ }
+ const request=(budget:AgentConnection)=>retryModelRequest(()=>requestAgentModelOnce(budget,model,messages,signal,attemptOptions),signal,()=>receivedOutput,options.onRetry)
  const budget = requestBudget(connection, model, messages, options.tools)
- try { const answer=await requestAgentModelOnce(budget, model, messages, signal, options);if(options.tools===false&&leakedToolSyntax.test(answer.content||''))throw new ModelFormatError('模型在无工具请求中返回了工具调用标记，未将其当作回答');return answer }
+ try { const answer=await request(budget);if(options.tools===false&&leakedToolSyntax.test(answer.content||''))throw new ModelFormatError('模型在无工具请求中返回了工具调用标记，未将其当作回答');return answer }
  catch (error) {
   signal.throwIfAborted()
   if (!(error instanceof ModelContextCapacityError)) throw error
@@ -84,7 +93,7 @@ export async function requestAgentModel(connection:AgentConnection,model:string,
   const retry = requestBudget(connection, model, messages, options.tools, error.inputTokens)
   if (retry.maxTokens >= budget.maxTokens) throw error
   // Only a rejected HTTP request is retried: no streamed answer or tool execution is replayed.
-  const answer=await requestAgentModelOnce(retry, model, messages, signal, options)
+  const answer=await request(retry)
   if(options.tools===false&&leakedToolSyntax.test(answer.content||''))throw new ModelFormatError('模型在无工具请求中返回了工具调用标记，未将其当作回答')
   return answer
  }
@@ -120,7 +129,7 @@ async function requestAgentModelUnmeasured(connection:AgentConnection,model:stri
   const responseCharacterLimit=Math.min(8*1024*1024,Math.max(1024*1024,connection.maxTokens*8)),responseWireLimit=Math.min(32*1024*1024,Math.max(8*1024*1024,responseCharacterLimit*8))
   if(connection.apiFormat==='anthropic')return await requestAnthropic(connection,model,messages,combined,options,requestTools,responseCharacterLimit,responseWireLimit,acceptUsage,activity)
   const response=await fetch(`${connection.endpoint.replace(/\/$/,'')}/chat/completions`,{method:'POST',headers:{'Content-Type':'application/json',...(connection.key?{Authorization:`Bearer ${connection.key}`}:{})},body:JSON.stringify({model,messages:messages.map(({reasoning_content,...message})=>({...message,...(isDeepSeek(connection.endpoint)&&reasoning_content!==undefined?{reasoning_content}:{})})),...deepseekThinking(connection.endpoint,thinking!==false),...(!requestTools||!requestTools.length?{}:{tools:requestTools,tool_choice:'auto'}),...(connection.localLlama&&thinking!==undefined?{chat_template_kwargs:{enable_thinking:thinking}}:{}),stream:true,stream_options:{include_usage:true},temperature:options.temperature??0.2,max_tokens:connection.maxTokens}),signal:combined})
-  if(!response.body)throw new Error('模型响应为空')
+  if(!response.body){if(!response.ok)throw new ModelRequestError(`模型请求失败（HTTP ${response.status}）：${response.statusText}`,response.status,modelRetryAfter(response.headers.get('retry-after')));throw new Error('模型响应为空')}
   let data:Record<string,unknown>
   if(response.ok&&response.headers.get('content-type')?.includes('text/event-stream')){
    let content='',reasoning='',characters=0,wireSize=0,finish=''
@@ -172,7 +181,7 @@ async function requestAgentModelUnmeasured(connection:AgentConnection,model:stri
     let code='';try{code=String(record(record(JSON.parse(text)).error).code||'')}catch{/* Preserve non-JSON errors below. */}
     if(response.status===404&&code==='model_not_found')throw new Error(`模型不存在或实例已失效（${model}）。请刷新模型列表，重新选择已加载的模型后继续任务。`)
     if(response.status===400&&/failed to (?:initialize samplers: failed to )?parse grammar/i.test(text))throw new Error('本地模型服务无法解析工具调用语法。已使用 llama.cpp 兼容 Schema；若重启应用后仍出现此错误，请更新本地运行时并重新测试模型的工具能力。')
-    throw new Error(`模型请求失败（HTTP ${response.status}）：${text.slice(0,600)}`)
+    throw new ModelRequestError(`模型请求失败（HTTP ${response.status}）：${text.slice(0,600)}`,response.status,modelRetryAfter(response.headers.get('retry-after')))
    }
    try{data=record(JSON.parse(text))}catch{throw new ModelFormatError('模型未返回有效 JSON 响应，请检查 OpenAI 兼容接口')}
    acceptUsage(data)
@@ -185,7 +194,7 @@ async function requestAgentModelUnmeasured(connection:AgentConnection,model:stri
  }catch(error){
   if(signal.aborted)throw signal.reason
   if(timeout.signal.aborted)throw timeout.signal.reason
-  if(record(error).name==='TimeoutError'||['UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT'].includes(String(record(record(error).cause).code)))throw new Error('模型连接超时，本轮未执行工具。请检查模型服务或缩小上下文后继续任务。')
+  if(record(error).name==='TimeoutError'||['UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT'].includes(String(record(record(error).cause).code)))throw new Error('模型连接超时，本轮未执行工具。请检查模型服务或缩小上下文后继续任务。',{cause:error})
   throw error
  }finally{clearTimeout(idle);clearTimeout(total)}
 }
@@ -228,8 +237,8 @@ function anthropicMessages(messages:AgentMessage[]){
 async function requestAnthropic(connection:AgentConnection,model:string,messages:AgentMessage[],signal:AbortSignal,options:RequestOptions,tools:false|ToolDefinition[]|undefined,responseCharacterLimit:number,responseWireLimit:number,acceptUsage:(data:unknown)=>void,activity:()=>void):Promise<AgentAnswer>{
  const converted=anthropicMessages(messages)
  const response=await fetch(`${connection.endpoint.replace(/\/$/,'')}/messages`,{method:'POST',headers:{'Content-Type':'application/json','anthropic-version':'2023-06-01',...(connection.key?{'x-api-key':connection.key}:{})},body:JSON.stringify({model,max_tokens:connection.maxTokens,messages:converted.messages,...(converted.system?{system:converted.system}:{}),...(!tools||!tools.length?{}:{tools:tools.map(tool=>({name:tool.function.name,description:tool.function.description,input_schema:tool.function.parameters}))}),stream:true}),signal})
- if(!response.body)throw new Error('模型响应为空')
- if(!response.ok){const body=await response.text();options.onResponse?.(body);const text=body.slice(0,1000);throw new Error(`Anthropic 模型请求失败（HTTP ${response.status}）：${text||response.statusText}`)}
+ if(!response.body){if(!response.ok)throw new ModelRequestError(`Anthropic 模型请求失败（HTTP ${response.status}）：${response.statusText}`,response.status,modelRetryAfter(response.headers.get('retry-after')));throw new Error('模型响应为空')}
+ if(!response.ok){const body=await response.text();options.onResponse?.(body);const text=body.slice(0,1000);throw new ModelRequestError(`Anthropic 模型请求失败（HTTP ${response.status}）：${text||response.statusText}`,response.status,modelRetryAfter(response.headers.get('retry-after')))}
  if(!response.headers.get('content-type')?.includes('text/event-stream')){
   const text=await response.text();options.onResponse?.(text);const data=record(JSON.parse(text));acceptUsage(data)
   return validateAnthropicAnswer(data,connection.maxTokens,options)

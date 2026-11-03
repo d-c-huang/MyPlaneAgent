@@ -54,6 +54,7 @@ export class CoreWorkflowAdapter {
         connection: input.connectionOverride,
         maxReplanAttempts: 1,
         maxSteps: input.maxSteps,
+        execution: input.execution,
         approve: async capability => {
           if(['agent.web_search','agent.web_fetch','browser.open','browser.read_page','browser.screenshot'].includes(capability))return (project?.webAccess||'allow')==='allow'
           if(project?.policy==='read-only'&&core.getCapabilityRegistry().get(capability)?.tags?.includes('requires-approval'))return false

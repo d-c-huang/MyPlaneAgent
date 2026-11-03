@@ -4,9 +4,10 @@ import type {AgentTask} from '../../shared/local-ai-agent.js'
 import {pinnedContext,type ContextMessage} from '../local-ai-context.js'
 
 export function sessionContextState(session:StudioSession,history:ContextMessage[],workspace?:string):ContextPinnedState {
+ workspace ??= session.defaultWorkspace?.path
  return pinnedContext(history,{
   taskId:session.abilityTask?.id||session.id,goal:session.taskPlan?.scope?.goal,
-  permissions:{workspace,filesEnabled:!!session.projectId||session.approvalMode==='full',webEnabled:session.webEnabled===true,approvalMode:session.approvalMode||'ask'},
+  permissions:{workspace,filesEnabled:!!workspace||!!session.projectId||session.approvalMode==='full',webEnabled:session.webEnabled===true,approvalMode:session.approvalMode||'ask'},
   acceptance:session.taskPlan?.items.filter(item=>item.status!=='complete').map(item=>JSON.stringify({title:item.title,acceptance:item.acceptance,verification:item.verification})),
   unresolvedEffects:Object.entries(session.operationJournal||{}).filter(([,operation])=>operation.status==='started').map(([id])=>({id,status:'started'})),
  })

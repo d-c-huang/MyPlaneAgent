@@ -1,6 +1,7 @@
 import { variableReference, mapVariableReferences } from '../../shared/workflow-variable-references.js';
 import { isDecision, validateDecision, evaluateRule, decisionValue, typedDecisionValue } from '../../shared/workflow-decisions.js';
 import { randomUUID } from "node:crypto";
+import {validateWorkflowExecution} from './workflow-execution.js';
 import fs from "node:fs";
 import { WorkflowValidationError } from "../../shared/workflow-validation.js";
 import path from "node:path";
@@ -341,6 +342,7 @@ export class WorkflowService {
         type: input.type,
         config: {
           instruction: text(input.config.instruction, "Agent 要求", 16000),
+          ...(input.config.execution===undefined?{}:{execution:validateWorkflowExecution(input.config.execution)}),
           ...(input.config.model
             ? { model: text(input.config.model, "模型", 500) }
             : {}),
@@ -1369,6 +1371,7 @@ export class WorkflowService {
               ...(plan.connection ? { connectionOverride: plan.connection } : {}),
               prompt,
               maxSteps: node.config.maxSteps,
+              execution: node.config.execution,
               fastMode: node.config.fastMode,
               approvalMode: node.config.approvalMode,
             },

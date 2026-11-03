@@ -5,6 +5,15 @@ import type {AgentTask} from '../shared/local-ai-agent.js'
 import type {ApplicationLogAction,ApplicationLogResult} from '../shared/application-log.js'
 contextBridge.exposeInMainWorld('myplane',{
  desktopPlatform:process.platform,
+ runtimeGraphWindow:(action:'open'|'close'|'state',sessionId?:string):Promise<boolean>=>ipcRenderer.invoke('runtime-graph:window',action,sessionId),
+ runtimeGraphSnapshot:(sessionId?:string):Promise<import('../shared/runtime-graph.js').RuntimeGraphSnapshot>=>ipcRenderer.invoke('runtime-graph:snapshot',sessionId),
+ runtimeGraphHistory:(sessionId:string):Promise<import('../shared/runtime-workbench.js').RuntimeHistoryIndex>=>ipcRenderer.invoke('runtime-graph:history',sessionId),
+ runtimeGraphFrame:(sessionId:string,id:string):Promise<import('../shared/runtime-workbench.js').RuntimeHistoryFrame>=>ipcRenderer.invoke('runtime-graph:history',sessionId,id),
+ runtimeGraphTemplates:(command?:import('../shared/runtime-workbench.js').TemplateCommand):Promise<import('../shared/runtime-workbench.js').SharedNodeTemplate[]>=>ipcRenderer.invoke('runtime-graph:templates',command),
+ runtimeGraphWorkflow:(sessionId:string):Promise<string>=>ipcRenderer.invoke('runtime-graph:workflow',sessionId),
+ runtimeGraphDetail:(sessionId:string,nodeId:string):Promise<import('../shared/runtime-workbench.js').WorkbenchNodeDetail>=>ipcRenderer.invoke('runtime-graph:detail',sessionId,nodeId),
+ runtimeGraphCommand:(command:import('../shared/runtime-workbench.js').WorkbenchCommand):Promise<import('../shared/runtime-workbench.js').WorkbenchNodeDetail>=>ipcRenderer.invoke('runtime-graph:command',command),
+ onRuntimeGraphSelection:(callback:(sessionId:string)=>void)=>{const listener=(_event:unknown,id:string)=>callback(id);ipcRenderer.on('runtime-graph:selection',listener);return()=>ipcRenderer.removeListener('runtime-graph:selection',listener)},
  inspectorSnapshot:()=>ipcRenderer.invoke('inspector:snapshot'),
  inspectorContext:(value:import('../shared/execution-inspector.js').InspectorWindowContext)=>ipcRenderer.invoke('inspector:context',value),
  inspectorWindow:(action:'open'|'close'|'state'):Promise<boolean>=>ipcRenderer.invoke('inspector:window',action),

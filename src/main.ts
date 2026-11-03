@@ -18,8 +18,8 @@ if(import.meta.hot)import.meta.hot.dispose(disposeFloatingMenus)
 const disposeTooltips=installTooltips()
 if(import.meta.hot)import.meta.hot.dispose(disposeTooltips)
 const params=new URLSearchParams(location.search)
-if(window.myplane?.desktopPlatform==='win32'&&!['performance','inspector'].includes(params.get('surface')||'')){
- const bar=document.createElement('div');document.body.prepend(bar);createApp(DesktopTitleBar).mount(bar)
+if(window.myplane?.desktopPlatform==='win32'&&!['performance','inspector','runtime-graph'].includes(params.get('surface')||'')){
+ const bar=document.createElement('div');document.body.prepend(bar);createApp(DesktopTitleBar,{minimal:!params.get('surface')}).mount(bar)
  document.documentElement.classList.add('desktop-titlebar-enabled')
 }
 if(!window.myplane){
@@ -32,6 +32,9 @@ if(!window.myplane){
   const recovery=document.createElement('p');recovery.textContent='如果这是应用主窗口，请完全退出后重新启动；仍无法恢复时，请检查预加载脚本是否完整安装。'
   panel.append(heading,explanation,recovery);root.replaceChildren(panel)
  }
+}else if(params.get('surface')==='runtime-graph'){
+ document.title='3D 运行视图 · MyPlaneAgent'
+ void import('./local-ai/RuntimeGraphWindow.vue').then(({default:RuntimeGraphWindow})=>createApp(RuntimeGraphWindow).mount('#app'))
 }else if(params.get('surface')==='inspector'){
  document.title='执行检查器 · MyPlaneAgent'
  void import('./local-ai/ExecutionInspectorWindow.vue').then(({default:ExecutionInspectorWindow})=>createApp(ExecutionInspectorWindow).mount('#app'))
@@ -57,4 +60,7 @@ if(!window.myplane){
   if(fallback&&!models.some(item=>item.id===fallback||item.instanceId===fallback))models.unshift({id:fallback,name:fallback,instanceId:undefined,modelRef:bootstrap.settings.source==='external'?{source:'remote' as const,id:fallback,name:fallback,apiFormat:bootstrap.settings.apiFormat,endpoint:bootstrap.settings.endpoint,contextLength:bootstrap.settings.contextLength}:{source:'current' as const,id:fallback,name:fallback}})
   createApp(WorkflowDesigner,{windowMode:true,workflowId:params.get('workflowId')||'',model:bootstrap.settings.source==='managed'?bootstrap.runtime.modelName:bootstrap.settings.model,models,appearanceStyle:bootstrap.settings.appearanceStyle,theme:bootstrap.settings.theme}).mount('#app')
  })
-}else createApp(LocalAiStudio,{standalone:true}).mount('#app')
+}else if(params.get('surface')==='workspace'){
+ document.title='工作区控制台 · MyPlaneAgent'
+ createApp(LocalAiStudio,{standalone:true,initialTab:'workflow'}).mount('#app')
+}else createApp(LocalAiStudio,{standalone:true,initialTab:'chat'}).mount('#app')

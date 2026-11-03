@@ -1,4 +1,5 @@
 import {workspaceVersion} from './core/evidence-version.js'
+import {createWorkflowExecution} from './workflow-execution.js'
 import {failureCode} from './core/execution-result.js'
 import {RuntimeStore} from './core/runtime-store.js'
 import {historyPage,workerKey,type HistoryQuery} from './core/worker-history.js'
@@ -21,7 +22,9 @@ import {WeatherWorkflow,parseWeatherRequest} from './core/weather-workflow.js'
 import {weatherSources} from './core/weather-source.js'
 import {learnExperience} from './core/experience-learning.js'
 import {randomUUID} from 'node:crypto'
-import { StaticPreview } from './static-preview.js'
+import { StaticPreview, previewCapabilityNames } from './static-preview.js'
+import {browserCapabilityNames,browserPluginState} from '../browser-plugin.js'
+import {browserAvailabilityContext} from './core/browser-availability.js'
 import { AgentCore } from './core/agent-core.js'
 import { CapabilityRegistry } from './core/capability-registry.js'
 import { SkillPlatform } from './core/skill-platform.js'
@@ -47,10 +50,12 @@ export interface AgentCoreServiceConfig {
   dataDir: string
   skillsDir: string
   getConnection: () => AgentConnection
+  assertCanStartRun?: () => void
   diagnosticLog?: (message: string) => void
 }
 
 export interface AgentRunOptions {
+  execution?:import('../../shared/workflow-execution.js').WorkflowExecutionPolicy
   webEnabled?:boolean
   projectId?: string
   model?: string
@@ -236,6 +241,7 @@ export class AgentCoreService extends EventEmitter {
     task: AgentTask,
     options: AgentRunOptions = {}
   ): Promise<ExecutionResult> {
+    this.config.assertCanStartRun?.()
     if (!this.initialized) throw new Error('Agent Core is not initialized')
     this.capabilityRegistry.refreshMCP()
     const taskId = task.id
@@ -301,22 +307,28 @@ export class AgentCoreService extends EventEmitter {
 
   /** Workflow adapter: same task graph, review gates and durable state as chat. */
   async runPlannedTask(task:AgentTask,options:AgentRunOptions={}):Promise<ExecutionResult> {
+    this.config.assertCanStartRun?.()
     if(this.runningTasks.has(task.id))throw new Error('任务仍在执行')
     const controller=new AbortController(),started=Date.now()
     this.runningTasks.set(task.id,controller)
     let answer='',outcome:string='blocked'
     const activities=new Map<string,import('../../shared/local-ai-studio.js').StudioToolActivity>()
+    let runtime:ReturnType<typeof createWorkflowExecution>|undefined
     try{
+      runtime=options.execution?createWorkflowExecution(options.execution,task.id,task.context.workspace,options.model||'',controller.signal):undefined
       await this.runConversation({connection:options.connection||this.config.getConnection(),model:options.model||'',messages:[{role:'user',content:task.description}],workspace:task.context.workspace,filesEnabled:true,webEnabled:options.webEnabled!==false,approvalMode:'ask',signal:controller.signal,maxRounds:options.maxSteps||undefined,
+        workbench:runtime?.workbench,
+        ...(runtime?{inspectTool:(capability:import('../../shared/types/capability.js').Capability,args:Record<string,unknown>,id:string,context?:import('../../shared/types/capability.js').CapabilityExecutionRequest['execution'],signal?:AbortSignal)=>runtime!.workbench.inspectTool(capability,args,id,context?.itemId||'main',context?.workerId,signal)}:{}),
         approve:activity=>options.approve?.(activity.capability,activity.args,controller.signal)??Promise.resolve(false),
         onActivity:activity=>{activities.set(activity.id,activity);this.emit('task-activity',{taskId:task.id,activity})},onContent:text=>{answer+=text},onReasoning:()=>{},onRequest:()=>{},onUsage:()=>{},onOutcome:value=>{outcome=value},
-        planExecution:{taskId:task.id,goal:task.description,save:plan=>this.emit('task-plan-updated',{taskId:task.id,plan})}})
+        planExecution:{taskId:task.id,goal:task.description,plan:runtime?.session.taskPlan,save:plan=>{if(runtime)runtime.session.taskPlan=plan;this.emit('task-plan-updated',{taskId:task.id,plan})}}})
       const result:ExecutionResult={success:outcome==='complete',answer,outputs:[...activities.values()].map(activity=>activity.output),errors:outcome==='complete'?[]:[answer||'任务尚未通过验收'],elapsedMs:Date.now()-started}
       this.emit('task-result',{taskId:task.id,result});return result
-    }finally{this.runningTasks.delete(task.id)}
+    }finally{runtime?.inspector.finish();runtime?.workbench.finish();this.runningTasks.delete(task.id)}
   }
 
   async runConversation(options: ChatRunOptions): Promise<void> {
+    this.config.assertCanStartRun?.()
     if(this.shuttingDown)throw new Error('Agent Core 正在关闭，不能启动新的对话任务')
     const controller=new AbortController()
     this.conversationControllers.add(controller)
@@ -347,6 +359,12 @@ export class AgentCoreService extends EventEmitter {
     }
     if (!this.initialized) throw new Error('Agent Core is not initialized')
     this.capabilityRegistry.refreshMCP()
+    const availableTools=new Set(this.capabilityRegistry.list().filter(cap=>cap.source.type==='builtin').map(cap=>cap.name))
+    const registered=(names:Set<string>)=>[...names].filter(name=>this.capabilityRegistry.get(name)?.source.type==='builtin')
+    const available=(names:Set<string>)=>[...names].filter(name=>availableTools.has(name))
+    options={...options,stateContext:[options.stateContext,browserAvailabilityContext({webEnabled:options.webEnabled,filesEnabled:options.filesEnabled,imageCapability:options.imageCapability,
+      browser:{...browserPluginState(),registered:registered(browserCapabilityNames),available:available(browserCapabilityNames)},
+      preview:{...this.preview.state(),registered:registered(previewCapabilityNames),available:available(previewCapabilityNames)}})].filter(Boolean).join('\n')}
     const content=options.messages.filter(message=>message.role==='user').at(-1)?.content
     const query=typeof content==='string'?content:''
     const execution=options.planExecution
@@ -578,6 +596,7 @@ export class AgentCoreService extends EventEmitter {
     return {
       initialized: this.initialized,
       runningTasks: this.runningTasks.size,
+      runningConversations: this.conversationRuns.size,
       skillsCount: this.skillPlatform.list().length,
       capabilitiesCount: this.capabilityRegistry.list().length,
       mcpServers: this.mcpAdapter.listServers().length

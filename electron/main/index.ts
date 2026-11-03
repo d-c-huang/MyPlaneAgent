@@ -1,6 +1,6 @@
 import {configureBrowserPlugin} from './browser-plugin.js'
 import {InternalBrowser} from './internal-browser.js'
-import {windowChrome,registerTitleMenu} from './window-chrome.js'
+import {windowChrome,registerTitleMenu,useMinimalWindowChrome} from './window-chrome.js'
 import {app,BrowserWindow,dialog,Menu,nativeTheme,shell,Tray,type MenuItemConstructorOptions} from 'electron'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -10,6 +10,7 @@ import {protectedHandle,trackAuthWindow} from './auth.js'
 import {ApplicationLogger} from './application-logger.js'
 import {helpDocumentMetadata,type HelpDocumentId} from '../shared/help-documents.js'
 import type {InspectorWindowContext} from '../shared/execution-inspector.js'
+import {RuntimeGraphWindow} from './runtime-graph-window.js'
 
 const directory=path.dirname(fileURLToPath(import.meta.url))
 app.setName('MyPlaneAgent')
@@ -22,6 +23,7 @@ const appIcon=path.join(directory,developmentUrl?'../../public/myplane-icon.png'
 const browser=new InternalBrowser(directory,developmentUrl)
 configureBrowserPlugin(browser)
 let window:BrowserWindow|undefined
+const runtimeGraphWindow=new RuntimeGraphWindow({directory,developmentUrl,icon:appIcon,owner:()=>window,snapshot:sessionId=>service!.runtimeGraphSnapshot(sessionId),history:sessionId=>service!.runtimeGraphHistory(sessionId),frame:(sessionId,id)=>service!.runtimeGraphFrame(sessionId,id),templates:command=>service!.runtimeGraphTemplates(command),workflow:sessionId=>service!.runtimeGraphWorkflow(sessionId),detail:(sessionId,nodeId)=>service!.runtimeGraphDetail(sessionId,nodeId),command:(command,owner)=>service!.runtimeGraphCommand(command,owner)})
 let workflowEditorWindow:BrowserWindow|undefined
 let performanceWindow:BrowserWindow|undefined
 let performanceBounds:Electron.Rectangle|undefined
@@ -100,6 +102,7 @@ function installApplicationMenu(){
    {label:'全选',role:'selectAll',accelerator:'CmdOrCtrl+A'},
   ]},
   {label:'视图',submenu:[
+   {label:'3D 运行视图',accelerator:'CmdOrCtrl+Shift+G',click:()=>void runtimeGraphWindow.open().catch(error=>logger.error('runtime-graph','无法打开运行视图',error))},
    {label:'内置浏览器',click:()=>void browser.open().catch(error=>logger.error('browser','无法打开浏览器',error))},
    {label:'重新加载',role:'reload',accelerator:'CmdOrCtrl+R'},{label:'强制重新加载',role:'forceReload',accelerator:'CmdOrCtrl+Shift+R'},
    ...(!app.isPackaged?[{label:'开发者工具',role:'toggleDevTools' as const,accelerator:process.platform==='darwin'?'Alt+Cmd+I':'Ctrl+Shift+I'}]:[]),
@@ -133,9 +136,10 @@ function showAbout(){
 async function createWindow(){
  if(window&&!window.isDestroyed()){focus();return}
  const next=new BrowserWindow({...windowChrome(),title:'MyPlaneAgent',width:1380,height:900,minWidth:520,minHeight:540,show:false,backgroundColor:nativeTheme.shouldUseDarkColors?'#181b1a':'#f5f8f6',icon:appIcon,webPreferences:{preload:path.join(directory,'../preload/index.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}})
+ useMinimalWindowChrome(next)
  window=next
  logger.info('window','创建主窗体')
- next.on('closed',()=>{logger.info('window','主窗体已关闭');if(window===next){window=undefined;inspectorWindow?.close();inspectorContext={requestId:'',content:'',reasoning:'',theme:'system'}}})
+ next.on('closed',()=>{logger.info('window','主窗体已关闭');if(window===next){window=undefined;runtimeGraphWindow.close();inspectorWindow?.close();inspectorContext={requestId:'',content:'',reasoning:'',theme:'system'}}})
  next.on('unresponsive',()=>logger.warn('window','主窗体无响应'))
  next.webContents.setWindowOpenHandler(()=>({action:'deny'}))
  next.webContents.on('will-navigate',event=>event.preventDefault())
@@ -212,6 +216,7 @@ else{
   }
   registerLocalAiStudio(()=>service!,()=>service?.dispose())
   registerTitleMenu()
+  runtimeGraphWindow.register()
   protectedHandle('inspector:context',(event,value:InspectorWindowContext)=>{
    if(event.sender.id!==window?.webContents.id)throw new Error('只能由主窗口同步对话')
    if(!value||typeof value.requestId!=='string'||typeof value.content!=='string'||typeof value.reasoning!=='string'||value.content.length+value.reasoning.length>1600000)throw new Error('检查器上下文无效')

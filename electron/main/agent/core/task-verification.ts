@@ -45,6 +45,9 @@ export async function verifyTaskRules(registry:CapabilityRegistry,options:ChatRu
       const activity:StudioToolActivity={id:randomUUID(),capability:'runtime.check_file',args:{...rule},status:'running'}
       try{
         if(!options.filesEnabled)throw new Error('文件访问未开启')
+        const inspectionSchema={type:'object',properties:Object.fromEntries(Object.entries(activity.args).map(([key,value])=>[key,{const:value}])),required:Object.keys(activity.args),additionalProperties:false}
+        if(options.inspectTool)await options.inspectTool({name:activity.capability,description:'按保存的验收条件检查文件',category:'verification',source:{type:'builtin'},runtime:'builtin',permissions:['file:read'],tags:[],parameters:inspectionSchema},activity.args,activity.id,options.executionContext,options.signal)
+        options.signal.throwIfAborted();options.workbench?.assertAllowed(options.executionContext?.itemId||'main',activity.capability)
         options.onActivity({...activity})
         const check=async():Promise<import('../../../shared/types/capability.js').CapabilityExecutionResult>=>{
           const root=new AgentWorkspace(options.workspace),file=root.resolve(rule.path,true)
@@ -69,7 +72,7 @@ export async function verifyTaskRules(registry:CapabilityRegistry,options:ChatRu
         // Fixed acceptance targets cannot be replaced by editing a verification call.
         const targets=Object.fromEntries(Object.entries(args).filter(([key])=>key!=='timeoutSeconds').map(([key,value])=>[key,{const:value}]))
         const inspectionSchema={allOf:[capability.parameters,{type:'object',properties:targets,required:Object.keys(targets)}]}
-        if(options.inspectTool){args=await options.inspectTool({...capability,parameters:inspectionSchema},args,activity.id);options.signal.throwIfAborted();activity.args=args}
+        if(options.inspectTool){args=await options.inspectTool({...capability,parameters:inspectionSchema},args,activity.id,options.executionContext,options.signal);options.signal.throwIfAborted();activity.args=args}
         validateToolArguments(inspectionSchema,args)
         validateToolArguments(capability.parameters,args)
         if(rule.kind==='test'){
@@ -84,6 +87,7 @@ export async function verifyTaskRules(registry:CapabilityRegistry,options:ChatRu
         activity.status='running';options.onActivity({...activity})
         const replayBlock=options.beforeExecution?.(capability,args)
         if(replayBlock)throw new Error(replayBlock)
+        options.workbench?.assertAllowed(options.executionContext?.itemId||'main',name)
         const execution=await registry.execute({capability:name,args,workspace:options.workspace,execution:{...options.executionContext,taskId:options.executionContext?.taskId||'verification',activityId:activity.id}},options.signal)
         options.afterExecution?.(capability,args,execution.success)
         options.signal.throwIfAborted()

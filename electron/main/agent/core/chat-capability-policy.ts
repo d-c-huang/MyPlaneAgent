@@ -12,7 +12,8 @@ const webTools=new Set(['agent.web_search','agent.web_fetch'])
 const processes=new Set(['agent.run_command','agent.run_test','agent.run_test_case','agent.build_project','agent.get_diagnostics'])
 
 const knownSkills = new Set(['agent-tools', 'file-operations', 'git-operations'])
-export function chatCapabilityAllowed(capability: Capability, options: Pick<ChatRunOptions, 'filesEnabled'|'webEnabled'|'taskScope'|'currentStep'|'workerMode'|'parallelReadOnly'|'parallelWrites'|'conversationOnly'|'readOnlyConversation'>): boolean {
+export function chatCapabilityAllowed(capability: Capability, options: Pick<ChatRunOptions, 'filesEnabled'|'webEnabled'|'taskScope'|'currentStep'|'workerMode'|'parallelReadOnly'|'parallelWrites'|'conversationOnly'|'readOnlyConversation'|'workbench'|'executionContext'>): boolean {
+  if(options.workbench&&!options.workbench.allows(options.executionContext?.itemId||'main',capability.name))return false
   if(options.conversationOnly)return false
   if(['runtime.current_time','runtime.read_evidence','runtime.read_history'].includes(capability.name))return true
   if(options.readOnlyConversation&&!['agent.inspect_project','agent.list_files','agent.search_files','agent.read_file','agent.read_files','agent.read_document','agent.dependency_report','agent.code_outline','agent.file_info'].includes(capability.name))return false

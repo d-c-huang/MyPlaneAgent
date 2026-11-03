@@ -4,9 +4,8 @@ import ConversationRunStatus from './ConversationRunStatus.vue'
 import VisualReviewCard from './VisualReviewCard.vue'
 import {visualReviewCard,visualDecisionText,type VisualDecision} from '../../electron/shared/visual-review'
 import ConversationOutline from './ConversationOutline.vue'
-import SessionExportMenu from './SessionExportMenu.vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { ArrowRight, ArrowUp, Close, Compass, Connection, DataLine, Files, FolderOpened, Download, EditPen, Grid, MagicStick, Operation, Search, Setting, VideoPause } from '@element-plus/icons-vue'
+import { ArrowRight, ArrowUp, Close, Compass, Connection, DataLine, Download, Files, FolderOpened, EditPen, Grid, MoreFilled, Operation, Search, Setting, VideoPause, Share } from '@element-plus/icons-vue'
 import { ElDialog } from 'element-plus'
 import { LOCAL_AI_MAX_OUTPUT_TOKENS } from '../../electron/shared/local-ai'
 import type { useLocalAiStudio } from './useLocalAiStudio'
@@ -22,7 +21,7 @@ import ChatApprovalButton from './ChatApprovalButton.vue'
 import {visibleTaskPlan} from '../../electron/shared/task-plan-presentation'
 
 const props = defineProps<{studio: ReturnType<typeof useLocalAiStudio>;showPerformanceLauncher:boolean;showInspectorLauncher:boolean}>()
-const emit = defineEmits<{models: [];performance: [];inspector: []}>()
+const emit = defineEmits<{models: []; menu: []; performance: []; inspector: []; runtimeGraph: []}>()
 const ch = reactive(props.studio)
 const visualItem=computed(()=>{const item=ch.session?.taskPlan?.items.find(item=>item.status!=='complete');return item&&visualReviewCard(item,ch.messages)?item:undefined})
 async function decideVisual(value:VisualDecision){
@@ -30,6 +29,7 @@ async function decideVisual(value:VisualDecision){
  await ch.send(false,{text:visualDecisionText(visualItem.value,value),images:[],visualDecision:value})
 }
 const locked = computed(() => ch.sending || ch.sessionBusy || ch.selectingChatModel)
+const navigationLocked = computed(() => ch.sessionBusy || ch.selectingChatModel)
 const hasConversation = computed(() => ch.messages.length > 0)
 const historyOpen = ref(false)
 const selectedArtifact = ref<ChatArtifact>()
@@ -39,7 +39,20 @@ const taskRows=computed(()=>conversationTaskRows(ch.session?.taskPlan))
 const attentionRows=computed(()=>taskRows.value.filter(taskNeedsAttention))
 const taskFilter=ref<'all'|'attention'>('all')
 const visibleTaskRows=computed(()=>taskFilter.value==='attention'?attentionRows.value:taskRows.value)
-const taskPanelOpen=ref(true)
+const taskPanelOpen=ref(false)
+const toolsMenu=ref<HTMLDetailsElement>()
+function closeTools(){if(toolsMenu.value){toolsMenu.value.open=false;toolsMenu.value.querySelector('summary')?.focus()}}
+function toolsKey(event:KeyboardEvent){
+ if(!['ArrowDown','ArrowUp','Home','End'].includes(event.key)||!toolsMenu.value)return
+ event.preventDefault();toolsMenu.value.open=true
+ const trigger=toolsMenu.value.querySelector(':scope > summary')
+ const buttons=[...toolsMenu.value.querySelectorAll<HTMLElement>('button:not(:disabled),details > summary')].filter(element=>{
+  const collapsed=element.closest('details:not([open])')
+  return element!==trigger&&(!collapsed||collapsed.querySelector(':scope > summary')===element)&&element.checkVisibility()
+ }),current=buttons.indexOf(document.activeElement as HTMLElement)
+ const index=event.key==='Home'?0:event.key==='End'?buttons.length-1:event.key==='ArrowDown'?(current+1)%buttons.length:current<0?buttons.length-1:(current-1+buttons.length)%buttons.length
+ buttons[index]?.focus()
+}
 const workspaceRoot=ref<HTMLElement>(),taskPanel=ref<HTMLElement>(),taskTrigger=ref<HTMLButtonElement>()
 const compactLayout=ref(false)
 const taskDrawerOpen=computed(()=>compactLayout.value&&taskPanelOpen.value&&!!taskList.value)
@@ -63,7 +76,7 @@ watch(artifacts,values=>{
  const latest=values.find(item=>item.path===selected.path&&item.id.startsWith(messagePrefix))
  if(latest)selectedArtifact.value=latest
 })
-watch(()=>ch.session?.id,()=>{selectedArtifact.value=undefined;taskPanelOpen.value=!compactLayout.value;taskFilter.value='all'})
+watch(()=>ch.session?.id,()=>{selectedArtifact.value=undefined;taskPanelOpen.value=false;taskFilter.value='all';if(toolsMenu.value)toolsMenu.value.open=false})
 const scroller = ref<HTMLElement>()
 const composerElement = ref<HTMLElement>()
 const composerHeight = ref(180)
@@ -104,44 +117,68 @@ async function focusSettingsTrigger() { await nextTick(); settingsTrigger.value?
   <main ref="workspaceRoot" class="agent-workspace unified-workspace chat-workbench" aria-label="会话工作区" :class="{'task-panel-visible':!!taskList&&taskPanelOpen,'artifact-panel-visible':!!selectedArtifact}" :style="{'--composer-height':composerHeight+'px'}" @keydown.esc="historyOpen=false;selectedArtifact=undefined">
     <button v-if="historyOpen" class="agent-history-backdrop" aria-label="收起会话导航" @click="historyOpen=false"></button>
     <aside class="agent-history" :class="{expanded:historyOpen}">
-      <header><div class="conversation-brand"><span class="conversation-brand-mark" aria-hidden="true">M</span><div><strong>MyPlaneAgent</strong><small>会话与工作</small></div></div><button class="agent-icon agent-history-close" aria-label="收起会话导航" @click="historyOpen=false"><Close/></button></header>
-      <button class="agent-new new-conversation-button" :disabled="locked" aria-label="新建会话" @click="selectSession()"><EditPen/><span>新建会话</span><span aria-hidden="true">＋</span></button>
+      <header><div class="conversation-brand"><span class="conversation-brand-mark" aria-hidden="true">M</span><div><strong>MyPlaneAgent</strong><small class="conversation-activity" :class="{active:ch.activeRunCount>0}" role="status" aria-live="polite"><i v-if="ch.activeRunCount" aria-hidden="true"/>{{ch.activeRunCount?`${ch.activeRunCount} 个任务进行中`:'会话与工作'}}</small></div></div><button class="agent-icon agent-history-close" aria-label="收起会话导航" @click="historyOpen=false"><Close/></button></header>
+      <button class="agent-new new-conversation-button" :disabled="navigationLocked" aria-label="新建会话" @click="selectSession()"><EditPen/><span>新建会话</span><span aria-hidden="true">＋</span></button>
       <label class="workspace-search"><Search/><input v-model="ch.sessionFilter" placeholder="搜索会话" aria-label="搜索会话"/><button v-if="ch.sessionFilter" class="agent-icon" aria-label="清除搜索" @click="ch.sessionFilter=''"><Close/></button></label>
       <ChatHistorySidebar :studio="studio" @open="selectSession"/>
+      <footer class="conversation-navigation-footer">
+        <button type="button" class="workspace-menu-button" title="打开工作区控制台与应用设置" aria-label="打开工作区菜单" @click="historyOpen=false;emit('menu')"><Grid/><span>工作区与设置</span><ArrowRight/></button>
+        <button type="button" class="conversation-connection" aria-label="模型与连接设置" @click="historyOpen=false;emit('models')"><span class="connection-indicator" :class="{online:ch.online}"/><span>{{ch.online?'模型已连接':'连接模型'}}<small>模型与服务</small></span><Setting/></button>
+      </footer>
     </aside>
     <section class="agent-main" :inert="taskDrawerOpen" :class="{'is-welcome':!hasConversation,'has-message-outline':ch.messages.filter(message=>message.role==='user').length>1}">
       <header class="agent-toolbar">
-        <button class="agent-icon agent-history-toggle" aria-label="展开会话导航" :aria-expanded="historyOpen" @click="historyOpen=!historyOpen"><Grid/></button>
-        <div class="workspace-heading"><strong>{{hasConversation?ch.session?.title:'新会话'}}</strong><button type="button" class="agent-workspace-picker" :disabled="locked" :title="ch.chatWorkspacePath||'选择工作目录，启用文件与命令工具'" aria-label="选择聊天工作目录" @click="ch.chooseChatWorkspace"><FolderOpened/><span>{{ch.chatWorkspacePath.split(/[\\/]/).filter(Boolean).pop()||'选择工作目录'}}</span></button></div>
-        <TokenUsageDisplay v-if="hasConversation" class="agent-token-usage" :usage="ch.session?.usage" :pending="ch.sending" label="Tokens" compact/>
-        <button v-if="showPerformanceLauncher" type="button" class="agent-icon window-launcher" title="显示性能窗口" aria-label="显示性能窗口" @click="emit('performance')"><DataLine/><span>性能</span></button>
-        <button v-if="showInspectorLauncher" type="button" class="agent-icon window-launcher" title="显示执行检查器" aria-label="显示执行检查器" @click="emit('inspector')"><Operation/><span>检查器</span></button>
-        <button type="button" class="agent-icon" title="内置浏览器" aria-label="打开内置浏览器" @click="openBrowser"><Connection/></button>
-        <SessionExportMenu v-if="ch.session?.messages.length" :disabled="locked" @select="ch.exportSession"/>
-<button v-if="artifacts.length" class="artifact-toggle" @click="selectedArtifact=selectedArtifact?undefined:artifacts[artifacts.length-1]">产物 {{artifacts.length}}</button>
-        <button v-if="taskList" ref="taskTrigger" type="button" class="task-list-toggle" aria-controls="floating-task-list" :aria-expanded="taskPanelOpen" @click="toggleTaskPanel">任务 {{taskList.completed}}/{{taskList.total}}<i v-if="attentionRows.length" class="task-attention-dot" aria-label="有待处理事项"></i></button>
-        <span class="workspace-local"><i :class="{online:ch.online}"/>{{ch.online?'已连接':'未连接'}}</span>
+        <button class="agent-icon agent-history-toggle" :aria-label="ch.activeRunCount?`展开会话导航，${ch.activeRunCount} 个任务进行中`:'展开会话导航'" :aria-expanded="historyOpen" @click="historyOpen=!historyOpen"><Grid/><span v-if="ch.activeRunCount" class="navigation-run-count" aria-hidden="true">{{ch.activeRunCount}}</span></button>
+        <div class="workspace-heading">
+          <strong>{{hasConversation?ch.session?.title:'新会话'}}</strong>
+          <button type="button" class="agent-workspace-picker" :disabled="locked" :title="ch.chatWorkspacePath||'选择工作目录，启用文件与命令工具'" aria-label="选择聊天工作目录" @click="ch.chooseChatWorkspace">
+            <FolderOpened/>
+            <span>{{ch.chatWorkspaceLabel}}</span>
+          </button>
+        </div>
+        <div class="toolbar-actions">
+          <button v-if="artifacts.length" class="artifact-toggle" @click="selectedArtifact=selectedArtifact?undefined:artifacts[artifacts.length-1]">产物 {{artifacts.length}}</button>
+          <button v-if="taskList" ref="taskTrigger" type="button" class="task-list-toggle" aria-controls="floating-task-list" :aria-expanded="taskPanelOpen" @click="toggleTaskPanel">任务 {{taskList.completed}}/{{taskList.total}}<i v-if="attentionRows.length" class="task-attention-dot" aria-label="有待处理事项"></i></button>
+          <details ref="toolsMenu" data-floating-menu class="conversation-tools-menu" @keydown="toolsKey">
+            <summary class="agent-icon" aria-label="会话工具" title="会话工具"><MoreFilled/></summary>
+            <div class="conversation-tools-popover">
+              <span class="conversation-tools-heading">会话工具</span>
+              <button type="button" aria-label="打开 3D 运行视图" @click="closeTools();emit('runtimeGraph')"><Share/><span>3D 运行视图</span><small>↗</small></button>
+              <button v-if="showPerformanceLauncher" type="button" aria-label="显示性能窗口" @click="closeTools();emit('performance')"><DataLine/><span>性能窗口</span><small>↗</small></button>
+              <button v-if="showInspectorLauncher" type="button" aria-label="显示执行检查器" @click="closeTools();emit('inspector')"><Operation/><span>执行检查器</span><small>↗</small></button>
+              <button type="button" aria-label="打开内置浏览器" @click="closeTools();openBrowser()"><Connection/><span>内置浏览器</span><small>↗</small></button>
+              <details v-if="ch.session?.messages.length" class="conversation-export-options"><summary aria-label="导出会话"><Download/><span>导出会话</span><ArrowRight/></summary><div><button v-for="format in (['pdf','md','json'] as const)" :key="format" type="button" :disabled="locked" @click="closeTools();ch.exportSession(format)">{{({pdf:'PDF 文档',md:'Markdown',json:'JSON 数据'})[format]}}</button></div></details>
+              <div v-if="hasConversation" class="conversation-tools-usage"><TokenUsageDisplay :usage="ch.session?.usage" :pending="ch.sending" label="累计 Tokens" compact/></div>
+            </div>
+          </details>
+        </div>
       </header>
       <ConversationRunStatus v-if="hasConversation" :messages="ch.messages" :sending="ch.sending" :loading="ch.sessionBusy" :approval="!!ch.chatApproval" :plan="ch.session?.taskPlan" :context="ch.session?.context" @open-tasks="openTasks"/>
       <div ref="scroller" class="agent-scroll message-scroll" :class="{'is-empty':!hasConversation}" @scroll="ch.trackScroll">
         <section v-if="!hasConversation" class="agent-welcome">
           <div class="welcome-intro">
-            <div class="welcome-copy"><div class="agent-welcome-label"><MagicStick aria-hidden="true"/><span>从一个目标开始</span></div><h1>让每个想法，<br/><span>都成为下一步。</span></h1><p>一起探索、创造，把值得做的事向前推进。</p></div>
-            <svg class="welcome-illustration" viewBox="0 0 220 200" fill="none" aria-hidden="true">
-              <defs><linearGradient id="welcome-plane" x1="45" y1="33" x2="174" y2="170" gradientUnits="userSpaceOnUse"><stop stop-color="#a78bfa"/><stop offset=".5" stop-color="#7261e8"/><stop offset="1" stop-color="#3c8de8"/></linearGradient><linearGradient id="welcome-trail" x1="14" y1="154" x2="204" y2="44" gradientUnits="userSpaceOnUse"><stop stop-color="#36cbb0"/><stop offset=".5" stop-color="#8b73ef"/><stop offset="1" stop-color="#f5aa79"/></linearGradient></defs>
-              <ellipse cx="112" cy="105" rx="91" ry="55" transform="rotate(-29 112 105)" stroke="url(#welcome-trail)" stroke-opacity=".45" stroke-dasharray="4 6"/>
-              <rect x="60" y="46" width="112" height="112" rx="30" transform="rotate(12 60 46)" fill="url(#welcome-plane)" fill-opacity=".12"/>
-              <rect x="64" y="35" width="108" height="118" rx="28" transform="rotate(12 64 35)" fill="url(#welcome-plane)"/>
-              <path d="m81 85 62-13-28 55-7-28-27-14Z" fill="white" fill-opacity=".95"/><path d="m108 99 35-27" stroke="#7964dc" stroke-width="2.5" stroke-linecap="round"/>
-              <rect x="10" y="118" width="55" height="48" rx="15" fill="#39bfa7"/><path d="m26 142 8 7 15-16" stroke="white" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
-              <rect x="158" y="33" width="44" height="44" rx="14" fill="#f6ae75"/><path d="m180 43 3 9 9 3-9 3-3 9-3-9-9-3 9-3 3-9Z" fill="white"/>
-              <circle cx="47" cy="55" r="5" fill="#7cbce9"/><circle cx="173" cy="159" r="7" fill="#c0a2f7"/><circle cx="100" cy="178" r="3" fill="#f1aa7b"/>
-            </svg>
+            <div class="welcome-copy">
+              <div class="agent-welcome-label" aria-hidden="true"><span>M</span></div>
+              <h1>有什么可以帮你？</h1>
+              <p>提问、梳理思路，或一起完成一项工作。</p>
+            </div>
           </div>
           <div class="conversation-starters">
-            <button type="button" @click="useStarter('分析当前项目的结构，说明主要模块与下一步建议，先不修改代码。')"><span class="starter-icon"><Compass aria-hidden="true"/></span><span class="starter-number" aria-hidden="true">01</span><strong>探索一个项目</strong><small>理清脉络，发现下一步</small><ArrowRight class="starter-arrow" aria-hidden="true"/></button>
-            <button type="button" @click="useStarter('帮我定位并修复这个问题，先核对原因，修改后验证结果：')"><span class="starter-icon"><EditPen aria-hidden="true"/></span><span class="starter-number" aria-hidden="true">02</span><strong>解决一个问题</strong><small>从定位到修改与验证</small><ArrowRight class="starter-arrow" aria-hidden="true"/></button>
-            <button type="button" @click="useStarter('帮我整理以下资料，归纳重点与待确认的问题：')"><span class="starter-icon"><Files aria-hidden="true"/></span><span class="starter-number" aria-hidden="true">03</span><strong>整理一些灵感</strong><small>提炼重点，让思路清晰</small><ArrowRight class="starter-arrow" aria-hidden="true"/></button>
+            <button type="button" @click="useStarter('分析当前项目的结构，说明主要模块与下一步建议，先不修改代码。')">
+              <span class="starter-icon"><Compass aria-hidden="true"/></span>
+              <strong>探索项目</strong>
+              <small>读懂结构与思路</small>
+            </button>
+            <button type="button" @click="useStarter('帮我定位并修复这个问题，先核对原因，修改后验证结果：')">
+              <span class="starter-icon"><EditPen aria-hidden="true"/></span>
+              <strong>解决问题</strong>
+              <small>定位原因并验证</small>
+            </button>
+            <button type="button" @click="useStarter('帮我整理以下资料，归纳重点与待确认的问题：')">
+              <span class="starter-icon"><Files aria-hidden="true"/></span>
+              <strong>整理资料</strong>
+              <small>提炼重点与待办</small>
+            </button>
           </div>
         </section>
         <WorkspaceChatMessages v-else :messages="ch.messages" :sending="ch.sending" @copy="ch.copy" @regenerate="ch.send(true)" @open-artifact="selectedArtifact=$event" @open-link="ch.openLink"/>
@@ -168,22 +205,41 @@ async function focusSettingsTrigger() { await nextTick(); settingsTrigger.value?
             <ChatComposerSelect :model-value="ch.chatModel" class="conversation-model-select" :models="ch.chatModels" :disabled="locked||!!ch.busy||ch.connecting" @update:model-value="ch.selectChatModel" @manage="emit('models')"/>
           </div><button v-if="ch.sending" type="button" class="agent-primary stop-button" title="停止" aria-label="停止生成" @click="ch.stop"><VideoPause/></button><button v-else class="agent-primary send-button" title="发送" aria-label="发送消息" :disabled="!ch.canSend"><ArrowUp/></button></footer>
         </form>
+        <p v-if="!hasConversation" class="conversation-composer-note">Enter 发送<span>·</span>Shift + Enter 换行</p>
       </div>
     </section>
     <button v-if="taskDrawerOpen" type="button" class="task-panel-backdrop" aria-label="收起任务清单" tabindex="-1" @click="closeTasks"></button>
     <aside v-if="taskList&&taskPanelOpen" ref="taskPanel" id="floating-task-list" class="floating-task-list" :role="taskDrawerOpen?'dialog':undefined" :aria-modal="taskDrawerOpen||undefined" aria-label="当前任务清单" @keydown="taskPanelKey">
-      <header><div><span class="task-panel-eyebrow">当前任务</span><strong>目标与进度</strong><small>{{taskList.completed}} / {{taskList.total}} 个阶段已完成</small></div><button type="button" class="agent-icon task-panel-close" aria-label="收起任务清单" @click="closeTasks"><Close/></button></header>
-      <div class="task-list-progress" role="progressbar" aria-label="任务完成进度" :aria-valuenow="taskList.completed" aria-valuemin="0" :aria-valuemax="taskList.total"><span :style="{width:`${taskList.total?taskList.completed/taskList.total*100:0}%`}"/></div>
-      <p v-if="ch.session?.taskPlan?.scope?.goal" class="task-list-goal" :title="ch.session.taskPlan.scope.goal"><span>当前目标</span>{{ch.session.taskPlan.scope.goal}}</p>
-      <div class="task-panel-filters" aria-label="筛选任务"><button type="button" :aria-pressed="taskFilter==='all'" @click="taskFilter='all'">全部阶段 <span>{{taskList.total}}</span></button><button type="button" :aria-pressed="taskFilter==='attention'" @click="taskFilter='attention'">待处理 <span>{{attentionRows.length}}</span></button></div>
-      <p v-if="!visibleTaskRows.length" class="task-panel-empty">目前没有需要你处理的事项。</p>
-      <ol v-else><li v-for="entry in visibleTaskRows" :key="entry.item.id" :class="'task-'+entry.status" :style="{'--task-depth':taskFilter==='all'?entry.depth:0}">
-        <span class="task-list-mark" aria-hidden="true">{{entry.status==='complete'?'✓':entry.status==='blocked'?'!':entry.status==='running'||entry.status==='verifying'?'…':'○'}}</span>
-        <div><strong :title="entry.item.title">{{entry.item.title}}</strong><small class="task-state-label">{{conversationTaskLabel(entry)}}<template v-if="entry.item.worker"> · {{({read:'读取',write:'修改',verify:'验收'})[entry.item.worker.mode]}}</template></small>
-          <p v-if="entry.status==='blocked'" :title="entry.attention?.completionReview?.reason||entry.attention?.summary">{{entry.attention?.completionReview?.reason||entry.attention?.summary||'请查看执行记录'}}</p>
-          <details v-if="entry.item.acceptance" class="task-acceptance"><summary>完成条件</summary><span>{{entry.item.acceptance}}</span></details>
+      <header class="task-panel-header">
+        <div class="task-panel-title">
+          <strong>目标与进度</strong>
+          <span class="task-progress-badge">{{taskList.completed}}/{{taskList.total}}</span>
         </div>
-      </li></ol><footer class="task-panel-footer">执行记录保留在对话中，完成状态以实际核验为准。</footer>
+        <button type="button" class="agent-icon task-panel-close" aria-label="收起任务清单" @click="closeTasks"><Close/></button>
+      </header>
+      <div class="task-list-progress" role="progressbar" aria-label="任务完成进度" :aria-valuenow="taskList.completed" aria-valuemin="0" :aria-valuemax="taskList.total"><span :style="{width:`${taskList.total?taskList.completed/taskList.total*100:0}%`}"/></div>
+
+      <div v-if="ch.session?.taskPlan?.scope?.goal" class="task-panel-goal" :title="ch.session.taskPlan.scope.goal">
+        <p>{{ch.session.taskPlan.scope.goal}}</p>
+      </div>
+
+      <div v-if="attentionRows.length" class="task-panel-filters" aria-label="筛选任务">
+        <button type="button" :aria-pressed="taskFilter==='all'" @click="taskFilter='all'">全部 ({{taskList.total}})</button>
+        <button type="button" :aria-pressed="taskFilter==='attention'" @click="taskFilter='attention'">待处理 ({{attentionRows.length}})</button>
+      </div>
+
+      <p v-if="!visibleTaskRows.length" class="task-panel-empty">无处理事项</p>
+      <ol v-else class="task-panel-list">
+        <li v-for="entry in visibleTaskRows" :key="entry.item.id" :class="'task-'+entry.status" :style="{'--task-depth':taskFilter==='all'?entry.depth:0}">
+          <span class="task-status-icon" aria-hidden="true">{{entry.status==='complete'?'✓':entry.status==='blocked'?'!':entry.status==='running'||entry.status==='verifying'?'•':'○'}}</span>
+          <div class="task-content">
+            <div class="task-title" :title="entry.item.title">{{entry.item.title}}</div>
+            <div class="task-meta">{{conversationTaskLabel(entry)}}<template v-if="entry.item.worker"> · {{({read:'读取',write:'修改',verify:'验收'})[entry.item.worker.mode]}}</template></div>
+            <p v-if="entry.status==='blocked'" class="task-blocked-msg" :title="entry.attention?.completionReview?.reason||entry.attention?.summary">{{entry.attention?.completionReview?.reason||entry.attention?.summary||'请查看执行记录'}}</p>
+            <details v-if="entry.item.acceptance" class="task-acceptance"><summary>完成条件</summary><span>{{entry.item.acceptance}}</span></details>
+          </div>
+        </li>
+      </ol>
     </aside>
     <ChatArtifactPanel v-if="selectedArtifact" :artifact="selectedArtifact" @close="selectedArtifact=undefined" @copy="ch.copy"/>
     <ElDialog v-model="settingsOpen" class="agent-settings agent-settings-dialog" modal-class="agent-settings-overlay" width="min(500px, calc(100vw - 32px))" :style="settingsTheme" :show-close="false" append-to-body align-center @closed="focusSettingsTrigger">

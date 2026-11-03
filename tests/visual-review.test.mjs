@@ -1,7 +1,48 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import {visualReviewCard,validateVisualDecision,visualDecisionText} from '../dist-electron/shared/visual-review.js'
+import {needsVisualEvidence,visualReviewQuestion,visualReviewCard,validateVisualDecision,visualDecisionText} from '../dist-electron/shared/visual-review.js'
 const hash='a'.repeat(64)
+test('explicitly excluded visual checks do not turn DOM acceptance into a visual task',()=>{
+ for(const acceptance of [
+  '点击按钮后 DOM 状态更新，不要求截图视觉验收。',
+  '无需视觉验收；只核对 DOM 与点击结果。',
+  '本项不需要额外进行画面检查',
+  '本轮无需人工查看截图确认画面',
+  '不必进行外观专项验收',
+  '不要求视觉和外观检查',
+  '不要求截图视觉验收也不要求画面验收',
+  '通过 DOM 验收，不要求 canvas 渲染截图',
+ ])assert.equal(needsVisualEvidence(acceptance),false,acceptance)
+})
+
+test('an unrelated or limited negation cannot erase affirmative visual requirements',()=>{
+ for(const acceptance of [
+  '画面精致美观，不要求截图视觉验收。',
+  '不要求截图视觉验收，但画面必须精致美观。',
+  '不要求性能检查，外观与设计一致。',
+  '无需截图，不过仍需确认画面清晰。',
+  '无需视觉验收并且画面不能空白。',
+  '不要求视觉验收且必须优化外观。',
+  '不要求截图视觉验收，确认 3D 模型实时渲染正确。',
+  '不是不需要视觉验收。',
+  '不要忽略画面验收。',
+  '不能把外观正确当作不要求视觉验收。',
+  '当前模型不支持视觉，但用户要求正面视角下显示玻璃墙。',
+  '在 canvas 中绘制场景，并核验渲染结果正确。',
+ ])assert.equal(needsVisualEvidence(acceptance),true,acceptance)
+})
+
+test('visual cards ignore negated acceptance and negated missing evidence while keeping real discovered gaps',()=>{
+ const f=fixture();f.item.acceptance='DOM 点击结果正确，不要求截图视觉验收'
+ assert.equal(visualReviewQuestion(f.item),undefined)
+ assert.equal(visualReviewCard(f.item,f.messages),undefined)
+ f.item.completionReview={status:'needs_input',reason:'待核对结果',nextStep:'读取 DOM 状态',missingEvidence:['无需视觉验收','按钮的 DOM 状态']}
+ assert.equal(visualReviewQuestion(f.item),undefined)
+ f.item.completionReview.nextStep='不要求查看截图确认画面'
+ assert.equal(visualReviewQuestion(f.item),undefined)
+ f.item.completionReview.missingEvidence.push('画面是否完整显示')
+ assert.match(visualReviewQuestion(f.item),/画面渲染/)
+})
 function fixture(){
  const item={id:'glass',title:'检查门头玻璃',acceptance:'正面视角下门头为玻璃墙',status:'blocked',outcome:'needs_input',evidenceIds:['shot'],attempts:1,summary:''}
  const shot={id:'shot',capability:'browser.screenshot',status:'complete',args:{},output:JSON.stringify({imageHash:hash,url:'http://127.0.0.1:1234/',capturedAt:'2026-09-27'}),images:[{name:'截图',dataUrl:'data:image/jpeg;base64,/9j/2Q=='}]}

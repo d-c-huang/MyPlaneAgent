@@ -270,7 +270,8 @@ export class AbilityModuleManager {
     }, delay)
     this.scheduled.unref()
   }
-  optimize(automatic = false): ModuleJob {
+  optimize(automatic = false, options: {autoPromote?:boolean;signal?:AbortSignal} = {}): ModuleJob {
+    options.signal?.throwIfAborted()
     if (this.disposed) throw new Error('模块管理器已关闭')
     if (!this.generate) throw new Error('尚未配置代码生成模型')
     if (this.running) throw new Error('已有优化任务正在运行')
@@ -281,9 +282,14 @@ export class AbilityModuleManager {
     const parentId = this.index.activeId
     const job: ModuleJob = { id: randomUUID(), createdAt: now(), updatedAt: now(), parentId, problemIds: problems.map(problem => problem.id), phase: 'queued', message: '等待分析问题原因' }
     const abort = new AbortController()
+    const cancel = () => abort.abort(options.signal?.reason || new Error('优化已取消'))
+    options.signal?.addEventListener('abort', cancel, {once:true})
     this.running = { job, abort }
     this.saveJob(job)
-    void this.improve(job, problems, abort, { ...this.index.policy }, this.index.revision)
+    // A caller can withhold publication for this candidate, never grant more
+    // than the saved policy. Its cancellation only affects this owned job.
+    void this.improve(job, problems, abort, { ...this.index.policy, autoPromote:this.index.policy.autoPromote&&options.autoPromote!==false }, this.index.revision)
+      .finally(()=>options.signal?.removeEventListener('abort',cancel))
     return { ...job }
   }
   private async improve(job: ModuleJob, problems: ModuleProblem[], abort: AbortController, policy: ModulePolicy, revision: number): Promise<void> {

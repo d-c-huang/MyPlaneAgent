@@ -15,6 +15,7 @@ export type StudioSettings = LocalAiSettings & {
   runtimePath: string
   runtimePort: number
   contextLength: number
+  managedContextLength?: number
   gpuLayers: number
   threads: number
   showTokenSpeed?: boolean
@@ -31,6 +32,7 @@ export type StudioSettings = LocalAiSettings & {
   appearanceStyle: 'minimal'|'ocean'|'paper'|'terminal'
 }
 export type StudioSettingsInput = LocalAiSettingsInput & Partial<Omit<StudioSettings,'hasApiKey'|'hasHfToken'>>
+export type StudioGenerationSettings = Pick<StudioSettings,'temperature'|'topP'|'maxTokens'|'repeatPenalty'>
 export type StudioModelFile = LocalAiModelFile & {format:string;quantization:string;revision?:string;sha256?:string}
 export type StudioModelDetails = {model:StudioDiscoveryModel;files:StudioModelFile[];revision:string;gated:boolean;contextLength?:number}
 export type StudioLocalModel = LocalAiDownloadEntry & {exists:boolean;format:string;quantization:string;imported?:boolean}
@@ -55,9 +57,12 @@ export type StudioToolActivity = {id:string;capability:string;args:Record<string
 export type StudioProgress = {id:string;type:'progress';text:string;phase:'working'|'reviewing'|'context';createdAt:string}
 export type StudioExecutionEntry = StudioProgress | {id:string;type:'tool';activityId:string;createdAt:string}
 export type StudioMessage = {visualDecision?:import('./visual-review.js').VisualDecision;abilityRoute?:import('./ability-modules.js').AbilityRoute;execution?:StudioExecutionEntry[];outcome?:'complete'|'needs_input'|'blocked';error?:string;toolActivity?:StudioToolActivity[];usage?:TokenUsage;usageTotals?:TokenUsageTotals;id:string;role:'user'|'assistant';content:string;images?:StudioImage[];reasoning?:string;createdAt:string;model?:string;elapsedMs?:number;tokens?:number;status?:'complete'|'stopped'|'error'}
-export type StudioSession = {operationJournal?:import('../main/agent/core/operation-journal.js').OperationJournal;taskPlan?:import('./task-plan.js').TaskPlan;abilityTask?:import('./ability-modules.js').AbilityTask;abilityState?:import('./ability-modules.js').ConversationState;conversationStartMessageId?:string;pinned?:boolean;webEnabled?:boolean;approvalMode?:StudioApprovalMode;projectId?:string;checkpoint?:ContextCheckpoint;context?:ContextStatus;usage?:TokenUsageTotals;id:string;title:string;model:string;systemPrompt:string;messages:StudioMessage[];createdAt:string;updatedAt:string}
-export type StudioSessionSummary = Omit<StudioSession,'messages'|'operationJournal'> & {messageCount:number}
-export type StudioEvent = {type:'task-plan';requestId:string;plan:import('./task-plan.js').TaskPlan}|{type:'progress';requestId:string;entry:StudioProgress}|{type:'outcome';requestId:string;outcome:'complete'|'needs_input'|'blocked'}|{type:'tool';requestId:string;activity:StudioToolActivity}|{type:'approval';requestId:string;approvalId:string;activity:StudioToolActivity}|{type:'context';requestId:string;context:ContextStatus;sessionUsage?:TokenUsageTotals}|{type:'delta';requestId:string;content:string;reasoning:string;usage?:TokenUsage;sessionUsage?:TokenUsageTotals}|{type:'finished';requestId:string;session:StudioSession;error?:string}
+export type StudioSession = {modelRef?:import('./local-ai-workflow.js').WorkflowModelRef;workbench?:import('./runtime-workbench.js').WorkbenchData;defaultWorkspace?:{kind:'cache'|'project';path:string};operationJournal?:import('../main/agent/core/operation-journal.js').OperationJournal;taskPlan?:import('./task-plan.js').TaskPlan;abilityTask?:import('./ability-modules.js').AbilityTask;abilityState?:import('./ability-modules.js').ConversationState;conversationStartMessageId?:string;pinned?:boolean;webEnabled?:boolean;approvalMode?:StudioApprovalMode;projectId?:string;checkpoint?:ContextCheckpoint;context?:ContextStatus;usage?:TokenUsageTotals;id:string;title:string;model:string;systemPrompt:string;messages:StudioMessage[];createdAt:string;updatedAt:string}
+export type StudioSessionSummary = Omit<StudioSession,'messages'|'operationJournal'|'workbench'> & {messageCount:number}
+/** Live state owned by the requesting window. The in-progress answer is excluded from session.messages. */
+export type StudioChatRun = {requestId:string;sessionId:string;session:StudioSession;pending:StudioMessage;startedAt:string;compactOnly:boolean;sequence:number;workspace?:{path:string;token:string};phase:'starting'|'running'|'waiting_approval'|'stopping';approvals:Array<{approvalId:string;activity:StudioToolActivity}>}
+export type StudioEventPayload = {type:'task-plan';requestId:string;plan:import('./task-plan.js').TaskPlan}|{type:'progress';requestId:string;entry:StudioProgress}|{type:'outcome';requestId:string;outcome:'complete'|'needs_input'|'blocked'}|{type:'tool';requestId:string;activity:StudioToolActivity}|{type:'approval';requestId:string;approvalId:string;activity:StudioToolActivity}|{type:'context';requestId:string;context:ContextStatus;sessionUsage?:TokenUsageTotals}|{type:'delta';requestId:string;content:string;reasoning:string;usage?:TokenUsage;sessionUsage?:TokenUsageTotals}|{type:'finished';requestId:string;session:StudioSession;error?:string}
+export type StudioEvent = StudioEventPayload & {sessionId:string;sequence:number}
 export type StudioHardware = {platform:string;arch:string;cpu:string;threads:number;totalMemory:number;freeMemory:number}
 export type StudioSnapshot = {downloads:StudioDownload[];runtime:StudioRuntime;hardware:StudioHardware;remoteModelCache:StudioRemoteModelCache[]}
 export type StudioBootstrap = StudioSnapshot & {settings:StudioSettings;models:StudioLocalModel[];sessions:StudioSessionSummary[];chatImagesSupported?:boolean;chatToolsSupported?:boolean}
@@ -106,15 +111,16 @@ export type StudioCommands = {
   updateSession:{input:{id:string;pinned?:boolean;projectId?:string;title?:string;model?:string;systemPrompt?:string};output:StudioSession}
   deleteSession:{input:{id:string};output:void}
   exportSession:{input:{id:string;format?:'md'|'pdf'|'json'};output:boolean}
-  chat:{input:{visualDecision?:import('./visual-review.js').VisualDecision;sessionId:string;requestId:string;text:string;images?:StudioImage[];model:string;regenerate?:boolean;webEnabled?:boolean;approvalMode?:StudioApprovalMode;workspaceToken?:string};output:{started:boolean}}
-  compactSession:{input:{sessionId:string;requestId:string;model:string};output:{started:boolean}}
+  chat:{input:{generation?:StudioGenerationSettings;modelRef?:import('./local-ai-workflow.js').WorkflowModelRef;visualDecision?:import('./visual-review.js').VisualDecision;sessionId:string;requestId:string;text:string;images?:StudioImage[];model:string;regenerate?:boolean;webEnabled?:boolean;approvalMode?:StudioApprovalMode;workspaceToken?:string};output:{started:boolean}}
+  chatRuns:{input:undefined;output:StudioChatRun[]}
+  compactSession:{input:{sessionId:string;requestId:string;model:string;modelRef?:import('./local-ai-workflow.js').WorkflowModelRef;generation?:StudioGenerationSettings};output:{started:boolean}}
   chatApprove:{input:{requestId:string;approvalId:string;approved:boolean;scope?:'once'|'similar'|'full'};output:void}
   stopChat:{input:{requestId:string};output:void}
-}&StudioDeveloperCommands&AgentCommands&AgentToolCommands&McpCommands&AutomationCommands&WorkflowCommands&SkillCommands&AgentCoreCommands&import('./ability-modules.js').AbilityModuleCommands&import('./ability-catalog.js').AbilityCatalogCommands
+}&StudioDeveloperCommands&AgentCommands&AgentToolCommands&McpCommands&AutomationCommands&WorkflowCommands&SkillCommands&AgentCoreCommands&import('./ability-modules.js').AbilityModuleCommands&import('./ability-catalog.js').AbilityCatalogCommands&import('./node-monitor.js').NodeMonitorCommands
 
 export type AgentCoreUiEvent = {taskId:string;event:CoreAgentEvent}|{taskId:string;result:CoreExecutionResult}|{taskId:string;error:string}|{taskId:string;cancelled:true}|{taskId:string;approval:{id:string;capability:string;args:Record<string,unknown>}}
 export type AgentCoreCommands = {
-  agentCoreStatus:{input:undefined;output:{enabled:boolean;available:boolean;initialized:boolean;runningTasks:number;skillsCount:number;capabilitiesCount:number;mcpServers:number}}
+  agentCoreStatus:{input:undefined;output:{enabled:boolean;available:boolean;initialized:boolean;runningTasks:number;runningConversations:number;skillsCount:number;capabilitiesCount:number;mcpServers:number}}
   agentCoreChooseWorkspace:{input:undefined;output:{path:string;token:string}|null}
   agentCoreListCapabilities:{input:undefined;output:Array<{name:string;category:string;source:'builtin'|'skill'|'mcp';description:string;parameters:Array<{name:string;type:string;required:boolean;description?:string}>;enabled:boolean;status:'active'}>}
   agentCoreRun:{input:{workspaceToken:string;model:string;prompt:string;mode:'general'|'coding'|'documents'};output:{taskId:string}}

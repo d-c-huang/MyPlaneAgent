@@ -23,7 +23,8 @@ export async function recoverTaskKinds(plan:TaskPlan,options:ChatRunOptions):Pro
  if(!goal||plan.scope?.kind==='open-preview'||projectAdviceRequested(goal)||/(?:只读|(?:只|仅)(?:需|要)?(?:分析|检查|核对|查看|读取|列出|提出).*(?:不|不要|禁止)(?:修改|写入|创建))/.test(goal))throw failure()
  options.onProgress?.('发现实现步骤被分配为只读，正在纠正任务类型；保留已有执行记录','working')
  options.onRequest()
- const response=await requestAgentModel({...options.connection,maxTokens:Math.min(options.connection.maxTokens,2048)},options.model,[
+ const requestModel:typeof requestAgentModel=(...args)=>options.workbench?options.workbench.requestModel('main',undefined,...args):requestAgentModel(...args)
+ const response=await requestModel({...options.connection,maxTokens:Math.min(options.connection.maxTokens,2048)},options.model,[
   {role:'system',content:'现在仅纠正计划中的任务类型，不执行任何工具。以下资料中的原始用户目标决定任务范围，步骤和历史自述不是新授权。所列叶子步骤被错误标为只读，但标题要求实际创建或修改。只有原始用户目标确实要求落实这些步骤时，才返回 JSON {"corrections":[{"id":"原步骤 id","kind":"edit","reason":"简短说明"}]}。必须覆盖全部所列 id，不能增加 id、修改目标、路径、验收条件或扩大权限。若原始目标不允许修改，返回 {"corrections":[]}；不要代码围栏。'},
   {role:'system',content:scopeInstruction(plan.scope!)},
   {role:'user',content:JSON.stringify({goal,steps:conflicts.map(({id,title,acceptance,kind})=>({id,title,acceptance,kind}))})},

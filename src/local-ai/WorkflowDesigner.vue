@@ -102,6 +102,7 @@ type FormNode = {
   type: WorkflowNode["type"];
   branches: FormBranch[];
   instruction: string;
+  executionJson: string;
   model: string;
   modelRef?: WorkflowModelRef;
   modelSource: "current" | "specified";
@@ -266,6 +267,7 @@ const newNode = (type: FormNode["type"] = "agent", index = 0): FormNode => {
     type,
     branches,
     instruction: "",
+    executionJson: "",
     model: props.model || props.models[0]?.id || "",
     modelSource: "current",
     mode: type === "ai-judge" ? "general" : "coding",
@@ -900,6 +902,7 @@ function fromNode(
         ? branches.map(branch => ({ ...branch, outputValue: '{"result":"","reason":""}' }))
         : branches,
     instruction: (node.type === "agent" || node.type === "ai-judge") ? node.config.instruction : "",
+    executionJson: (node.type === 'agent'||node.type === 'ai-judge')&&node.config.execution ? JSON.stringify(node.config.execution,null,2) : '',
     model: (node.type === "agent" || node.type === "ai-judge") ? node.config.model || "" : props.model || "",
     modelRef: (node.type === "agent" || node.type === "ai-judge") ? node.config.modelRef : undefined,
     modelSource:
@@ -1046,6 +1049,7 @@ function payload(): WorkflowDefinitionInput {
         type: node.type,
         config: {
           instruction: node.instruction,
+          ...(node.executionJson.trim()?{execution:JSON.parse(node.executionJson)}:{}),
           modelSource: node.modelSource,
           ...(node.modelSource === "specified" && node.model.trim()
             ? { model: node.model.trim() }
@@ -2507,6 +2511,7 @@ onBeforeUnmount(() => {
                     max="500"
                 /></label>
               </div>
+              <details v-if="selectedNode.type==='agent'" class="workflow-execution-policy"><summary>任务验收与执行约束</summary><p class="workflow-field-note">从 3D 工作台生成的流程保留工具限制、请求预算、任务类型、文件范围及验收规则。此处修改后保存为新流程版本；执行使用流程独立工作目录。</p><label>约束 JSON<textarea v-model="selectedNode.executionJson" aria-label="工作流执行约束" rows="10" placeholder='{"tools":["agent.read_file"],"maxRequests":10}'/></label><p class="workflow-field-note">留空使用默认约束；tools 为空数组时禁用全部工具。保存时验证格式。</p></details>
               <label
                 >权限<select v-model="selectedNode.approvalMode">
                   <option value="ask">安全</option>

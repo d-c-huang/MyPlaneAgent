@@ -754,6 +754,33 @@ test('changed queries with identical search evidence switch to page reading and 
  })
 })
 
+test('repeated calls to paused search synthesize evidence and clarify missing information',async()=>{
+ const executions=[],activities=[]
+ let searchCall,outcome,content=''
+ await withModel((input,n)=>{
+  if(n<=3){searchCall=toolCall(input,'agent.web_search',{query:'character '+n});return searchCall}
+  if(n<=5){
+   assert.equal(input.tools.some(tool=>tool.function.description.startsWith('agent.web_search:')),false)
+   return searchCall
+  }
+  assert.ok(!input.tools?.length)
+  assert.match(JSON.stringify(input.messages),/duplicate-search-results/)
+  return {content:'搜索结果无法确定角色，请提供角色图片或说明。'}
+ },async(connection,requests)=>{
+  const registry={list:()=>[capability('agent.web_search'),capability('agent.web_fetch')],execute:async request=>{
+   executions.push(request.capability)
+   return {success:true,output:{query:request.args.query,results:[{url:'https://example.com/unrelated',title:'无关资料'}]}}
+  }}
+  await runCoreChat(registry,options(connection,{approvalMode:'full',onActivity:activity=>activities.push(activity),onOutcome:value=>outcome=value,onContent:text=>content+=text}))
+  assert.ok(requests.length<=8)
+ },()=>({content:JSON.stringify({status:'needs_input',reason:'现有结果无法确认角色，需要角色图片或说明。',nextStep:'提供角色图片或说明。'})}))
+ assert.deepEqual(executions,['agent.web_search','agent.web_search','agent.web_search'])
+ assert.equal(activities.filter(activity=>activity.status==='error').length,2)
+ assert.equal(outcome,'needs_input')
+ assert.match(content,/角色图片或说明/)
+ assert.doesNotMatch(content,/不存在或未授权/)
+})
+
 test('research handoff is corrected into a page read; failed text fetch can use authorized browser readers',async()=>{
  const names=['agent.web_fetch','browser.open','browser.read_page'],calls=[]
  const caps=names.map(name=>({...capability(name),...(name.startsWith('browser.')?{source:{type:'builtin'},runtime:'builtin'}:{})}))

@@ -82,7 +82,7 @@ export class ExecutionRuntime {
     if(context?.mode==='read'&&(effectful||isProcess))return failure('只读子任务不能执行修改或项目命令','permission')
     const previewCommand=context?.kind==='preview'&&isPreviewCommand(request.workspace||'',capability.name,request.args)
     if(context?.mode==='verify'&&effectful&&!capability.name.startsWith('browser.')&&!previewCommand)return failure('验收子任务不能修改文件；需要修复时交回调度器','permission')
-    if(effectful&&!capability.name.startsWith('browser.')&&context?.writeScopes?.length){const error=scopeFailure(request.workspace||'',request.args,context.writeScopes);if(error)return failure(error,'permission')}
+    if(effectful&&!capability.name.startsWith('browser.')&&!previewCommand&&context?.writeScopes?.length){const error=scopeFailure(request.workspace||'',request.args,context.writeScopes);if(error)return failure(error,'permission')}
     const budget=context?.budget
     if(budget?.limit!==undefined&&budget.used>=budget.limit)return failure(`子智能体工具调用已达到本项上限（${budget.used}/${budget.limit} 次）；调整设置的上限后可继续。`,'budget')
     if(budget)budget.used++
@@ -101,7 +101,7 @@ export class ExecutionRuntime {
       signal.throwIfAborted()
       // A queued operation must not inherit a changed symlink or scope while it waits.
       if(identity!==undefined){try{if(pathIdentity()!==identity)return failure('等待期间工作目录或文件路径发生变化，请重新读取后再执行。','conflict')}catch{return failure('等待期间文件路径已不可用，请重新核对。','conflict')}}
-      if(effectful&&!capability.name.startsWith('browser.')&&context?.writeScopes?.length){const error=scopeFailure(request.workspace||'',request.args,context.writeScopes);if(error)return failure(error,'permission')}
+      if(effectful&&!capability.name.startsWith('browser.')&&!previewCommand&&context?.writeScopes?.length){const error=scopeFailure(request.workspace||'',request.args,context.writeScopes);if(error)return failure(error,'permission')}
       if(effectful&&context?.parallel==='scoped-write'){const error=scopeFailure(request.workspace||'',request.args,[context.reservedWritePaths||[]],true);if(error)return failure(error,'permission')}
       const logicalWorkspace=context?.workspace??workspace
       const effectKey=effectful&&context?operationKey(context.taskId,logicalWorkspace,capability.name,request.args):undefined

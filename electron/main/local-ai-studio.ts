@@ -8,6 +8,9 @@ import {AbilityModuleManager} from './ability-modules/manager.js';
 import {AbilityCatalogService} from './ability-modules/catalog.js';
 import {policyContracts} from './ability-modules/policies.js';
 import {AbilityPolicyRuntime} from './ability-modules/policy-runtime.js';
+import {NodeMonitor,type MonitorRepairResult} from './node-monitor.js';
+import {analyzeMonitorIssue,hostMonitorDiagnosis,repairMonitorModule} from './node-monitor-actions.js';
+import type {NodeMonitorCommand,NodeMonitorIssue,NodeMonitorPhase,NodeMonitorPolicy} from '../shared/node-monitor.js';
 import {routerContract,validateRouterOutput,explicitNewTask,lookupBoundary,standaloneLookup,standaloneProjectTask,taskMessages,taskProgress} from './ability-modules/routing.js';
 import {classifyTaskRelation,legacyProjectOverviewBoundary,legacyWeatherIdentityBoundary,ordinaryConversationMessage,projectOverviewQuestion,socialConversationMessage} from './ability-modules/task-relation.js';
 import {implementsPriorAdvice,projectAdviceRequested} from '../shared/task-scope.js';
@@ -26,6 +29,12 @@ import { modelCapacity, ModelContextCapacityError } from './agent/model-budget.j
 import type { ChatRunOptions } from './agent/core/chat-runner.js';
 import { ExecutionInspector } from './agent/core/execution-inspector.js';
 import {sessionContextState} from './agent/context-state.js';
+import {RuntimeGraphStore} from './runtime-graph-store.js';
+import {RuntimeGraphHistory} from './runtime-graph-history.js';
+import {RuntimeTemplateLibrary} from './runtime-template-library.js';
+import {runtimeWorkflowDraft} from './runtime-workflow-export.js';
+import {RuntimeWorkbench} from './agent/core/runtime-workbench.js';
+import type {WorkbenchCommand} from '../shared/runtime-workbench.js';
 import {externalModelPerformance} from './external-model-performance.js';
 import { workflowValidationMessage } from "../shared/workflow-validation.js";
 import {
@@ -61,6 +70,7 @@ import {
 } from "electron";
 import {
   existsSync,
+  mkdirSync,
   statSync,
   readdirSync,
   readFileSync,
@@ -74,6 +84,7 @@ import os from "node:os";
 import { randomUUID, createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { LocalAiService } from "./local-ai.js";
+import { LOCAL_AI_MAX_OUTPUT_TOKENS } from "../shared/local-ai.js";
 import { LocalAiDownloads } from "./local-ai-downloads.js";
 import { LocalAiRuntime } from "./local-ai-runtime.js";
 import { LocalAiModelIcons } from "./local-ai-model-icons.js";
@@ -112,8 +123,10 @@ import {
 import type {
   StudioBootstrap,
   StudioCommands,
+  StudioChatRun,
   StudioConnection,
   StudioEvent,
+  StudioEventPayload,
   StudioLocalModel,
   StudioMessage,
   StudioModelDetails,
@@ -193,9 +206,187 @@ const taskPreviewPaths = (task: AgentTask) => {
 export class LocalAiStudioService extends LocalAiService {
   private preferences: Partial<StudioSettings> & {
     deepseekDefaultsVersion?: number;
+    managedContextLength?: number;
   };
   private readonly preferencesFile: string;
   private readonly sessionsDirectory: string;
+  private readonly runtimeGraph = new RuntimeGraphStore();
+  private readonly graphHistory:RuntimeGraphHistory;
+  private readonly nodeTemplates:RuntimeTemplateLibrary;
+  private readonly graphHistoryErrors=new Map<string,string>();
+  runtimeGraphHistory(sessionId:string){const error=this.graphHistoryErrors.get(sessionId);if(error)throw new Error(error);return this.graphHistory.index(sessionId)}
+  runtimeGraphFrame(sessionId:string,frameId:string){return this.graphHistory.frame(sessionId,frameId)}
+  runtimeGraphTemplates(command?:import('../shared/runtime-workbench.js').TemplateCommand){return command?this.nodeTemplates.command(command):this.nodeTemplates.list()}
+  runtimeGraphWorkflow(sessionId:string){return this.workflow.save(runtimeWorkflowDraft(this.workbench(sessionId))).id}
+  private captureGraph(sessionId:string,runId:string,label:string,flush=false){
+    try{this.graphHistory.capture(this.runtimeGraphSnapshot(sessionId),runId,label);if(flush)this.graphHistory.flush(sessionId);this.graphHistoryErrors.delete(sessionId)}
+    catch(error){this.graphHistoryErrors.set(sessionId,'运行历史保存失败：'+String(error));this.applicationLog?.('warn','runtime-history','运行历史保存失败：'+String(error))}
+  }
+  private runtimeGraphLoaded = false;
+  private readonly workbenches=new Map<string,RuntimeWorkbench>();
+  private readonly workbenchResumeRequests=new Set<string>();
+  private nodeMonitor?:NodeMonitor;
+  private nodeMonitorError='';
+  private monitorOwner?:WebContents;
+  private readonly monitorSessionOwners=new Map<string,WebContents>();
+  private readonly chatCompletions=new Map<string,Promise<void>>();
+  private observeMonitor(session:StudioSession,active=[...this.chats.values()].some(run=>run.sessionId===session.id)){
+    try{this.nodeMonitor?.observeSession(session,active)}catch(error){this.applicationLog?.('warn','node-monitor','监控记录失败：'+String(error))}
+  }
+  private scanMonitorSessions(){
+    if(!this.nodeMonitor||!existsSync(this.sessionsDirectory))return;
+    try{
+      const files=readdirSync(this.sessionsDirectory).filter(file=>/^[a-f\d-]{36}\.json$/i.test(file)).map(file=>({file,time:statSync(path.join(this.sessionsDirectory,file)).mtimeMs})).sort((a,b)=>b.time-a.time).slice(0,40);
+      for(const {file} of files){
+        try{const session=readIntegrationJson<StudioSession|undefined>(path.join(this.sessionsDirectory,file),undefined);if(session?.id===file.slice(0,-5)&&Array.isArray(session.messages))this.observeMonitor(session)}
+        catch(error){this.applicationLog?.('warn','node-monitor','跳过不可读取的会话：'+String(error))}
+      }
+      this.nodeMonitor.scanModules();
+    }catch(error){this.applicationLog?.('warn','node-monitor','监控扫描失败：'+String(error))}
+  }
+  nodeMonitorState(owner?:WebContents){
+    if(owner&&!owner.isDestroyed())this.monitorOwner=owner;
+    if(!this.nodeMonitor)throw new Error(this.nodeMonitorError||'节点监控尚未初始化');
+    return this.nodeMonitor.snapshot();
+  }
+  nodeMonitorCommand(input:NodeMonitorCommand,owner?:WebContents){
+    if(owner&&!owner.isDestroyed())this.monitorOwner=owner;
+    if(!this.nodeMonitor)throw new Error(this.nodeMonitorError||'节点监控尚未初始化');
+    const result=this.nodeMonitor.command(input);
+    if(input.action==='scan'||input.action==='policy'&&input.policy.enabled)this.scanMonitorSessions();
+    return input.action==='scan'||input.action==='policy'?this.nodeMonitor.snapshot():result;
+  }
+  private async analyzeMonitor(issue:NodeMonitorIssue,signal:AbortSignal){
+    const determined=hostMonitorDiagnosis(issue);if(determined)return determined;
+    if(issue.sessionId){
+      // Preserve the conversation's chosen provider; never mutate global settings
+      // or silently send this conversation's diagnostics to a different provider.
+      const session=this.session(issue.sessionId),selected=this.chatModel(session.model,session.modelRef),settings=this.inferenceSettings(selected.model,selected.settings);
+      if(settings.source==='managed'&&this.runtime.snapshot().state!=='running')throw new Error('该会话的本地模型未运行，待加载后重试诊断');
+      return analyzeMonitorIssue(issue,{...selected.service,maxTokens:settings.maxTokens,contextLength:settings.contextLength,localLlama:settings.source==='managed'},selected.model,signal);
+    }
+    const model=await this.workflowCurrentModel();if(!model)throw new Error('请先选择用于监控分析的模型');
+    return analyzeMonitorIssue(issue,this.agentConnection(),model,signal);
+  }
+  private async repairMonitor(issue:NodeMonitorIssue,policy:NodeMonitorPolicy,signal:AbortSignal,onPhase:(phase:NodeMonitorPhase,message:string)=>void):Promise<MonitorRepairResult>{
+    if(issue.source==='module'&&issue.moduleId&&issue.diagnosis?.action==='optimize_module')return repairMonitorModule(issue,this.abilityCatalog.managed(issue.moduleId),{autoApply:policy.autoApply,signal,onPhase});
+    const waiting=(message:string):MonitorRepairResult=>({phase:'waiting',message});
+    if(issue.source!=='node'||issue.retryable!==true||issue.diagnosis?.action!=='retry_node'||!issue.sessionId||!issue.taskId||!issue.nodeId)return waiting('此问题需要明确的节点恢复条件，未重新运行整个会话。');
+    signal.throwIfAborted();
+    if([...this.chats.values()].some(run=>run.sessionId===issue.sessionId))return waiting('原会话仍在运行，等待本轮结束后再核对。');
+    const session=this.session(issue.sessionId),plan=session.taskPlan,item=plan?.items.find(row=>row.id===issue.nodeId);
+    if(!plan||plan.taskId!==issue.taskId||session.abilityTask?.id!==issue.taskId||!item)return waiting('原任务或节点已变化，未启动恢复。');
+    if(item.status==='complete')return {phase:'resolved',message:'原节点已经通过验收，无需重复执行。'};
+    if(plan.needsReplan||session.abilityTask.status==='paused'||item.runtime?.status==='cancelled'||item.outcome==='needs_input'||item.runtime?.waitReason==='approval')return waiting('当前节点需要用户确认、恢复暂停或调整任务，监控不会替代用户决定。');
+    if(item.status!=='blocked'||plan.items.find(row=>row.status!=='complete')?.id!==item.id)return waiting('该节点尚未成为可恢复的当前项，保留现有依赖顺序。');
+    const settings=this.studioSettings();
+    if(settings.showExecutionInspector&&settings.pauseBeforeAgentCalls)return waiting('逐步执行检查已开启，请从原会话继续并确认检查点。');
+    const previousOwner=this.monitorSessionOwners.get(session.id),owner=previousOwner&&!previousOwner.isDestroyed()?previousOwner:this.monitorOwner;
+    if(!owner||owner.isDestroyed())return waiting('请打开节点监控或原会话窗口后重试，以便保留审批与停止控制。');
+    const grant=[...this.agentWorkspaces].find(([,value])=>value.owner===owner.id&&value.path===plan.workspace);
+    const project=session.projectId?this.agent.projects().find(row=>row.id===session.projectId):undefined;
+    const cache=path.join(this.dataRoot,'cache','tasks',session.id);
+    if(!grant&&plan.workspace!==project?.workspace&&plan.workspace!==cache)return waiting('原目录授权已失效，请在原会话重新选择目录。');
+    const requestId=randomUUID();this.workbenchResumeRequests.add(requestId);
+    const abort=()=>this.chats.get(requestId)?.controller.abort(signal.reason||new Error('监控恢复已取消'));
+    signal.addEventListener('abort',abort,{once:true});
+    try{
+      signal.throwIfAborted();onPhase('repairing','正在恢复原任务的当前失败节点；保留原权限和已完成步骤。');
+      await this.startChat({sessionId:session.id,requestId,model:session.model,modelRef:session.modelRef,...(grant?{workspaceToken:grant[0]}:{}),text:'继续当前已保存的任务，只执行未完成和已标记过期的节点。'},owner);
+      const pending=this.chatCompletions.get(requestId);
+      if(pending){await new Promise<void>((resolve,reject)=>{const stop=()=>reject(signal.reason||new Error('监控恢复已取消'));signal.addEventListener('abort',stop,{once:true});void pending.then(()=>{signal.removeEventListener('abort',stop);resolve()},error=>{signal.removeEventListener('abort',stop);reject(error)});if(signal.aborted)stop()})}
+      signal.throwIfAborted();onPhase('verifying','正在核对原节点保存的实际验收状态。');
+      const latest=this.session(session.id),restored=latest.taskPlan?.taskId===issue.taskId?latest.taskPlan.items.find(row=>row.id===issue.nodeId):undefined;
+      return restored?.status==='complete'?{phase:'resolved',message:'原失败节点已通过实际验收；已完成步骤保持不变。'}:waiting(restored?.summary?.slice(0,1000)||'本次恢复尚未完成，已保留原会话进度。');
+    }finally{signal.removeEventListener('abort',abort);this.workbenchResumeRequests.delete(requestId)}
+  }
+  private workbench(sessionId:string){
+    const live=this.workbenches.get(sessionId);
+    if(live?.active)return live;
+    const session=this.session(sessionId),controller=new RuntimeWorkbench(session,new ExecutionInspector(new AbortController().signal),()=>this.saveSession(session));
+    controller.active=false;return controller;
+  }
+  runtimeGraphDetail(sessionId:string,nodeId:string){
+    const requestId=[...this.chats].find(([,chat])=>chat.sessionId===sessionId)?.[0];
+    const controller=this.workbench(sessionId),detail=controller.detail(nodeId,requestId);
+    detail.approvals=[...this.chatApprovals].filter(([,row])=>row.requestId===requestId&&(nodeId==='task:root'||(row.activity.workerId?controller.session.taskPlan?.items.find(item=>item.worker?.id===row.activity.workerId)?.id:'main')===detail.scopeId)).map(([id,row])=>({id,callId:row.activity.id,capability:row.activity.capability,args:row.activity.args}));
+    return detail;
+  }
+  async runtimeGraphCommand(command:WorkbenchCommand,owner:Electron.WebContents){
+    if(!command||typeof command!=='object'||typeof command.sessionId!=='string'||typeof command.nodeId!=='string')throw new Error('运行控制参数无效');
+    const entry=[...this.chats].find(([,chat])=>chat.sessionId===command.sessionId),controller=this.workbench(command.sessionId);
+    if(entry&&(entry[1].owner!==owner.id||command.requestId!==entry[0]))throw new Error('运行实例已变化或不属于当前窗口，请刷新');
+    let resumeWorkspaceToken:string|undefined;
+    if(command.action==='retry'){
+      if(entry)throw new Error('此会话仍有任务运行，请等待结束后恢复');
+      const plan=controller.session.taskPlan,task=controller.session.abilityTask;
+      if(!plan||!task||task.id!==plan.taskId)throw new Error('没有可恢复的任务上下文，请在主窗口继续此会话');
+      const grant=[...this.agentWorkspaces].find(([,grant])=>grant.owner===owner.id&&grant.path===plan.workspace);
+      const project=controller.session.projectId?this.agent.projects().find(project=>project.id===controller.session.projectId):undefined;
+      if(grant)resumeWorkspaceToken=grant[0];
+      else if(plan.workspace!==project?.workspace&&plan.workspace!==this.ensureCacheWorkspace(command.sessionId))throw new Error('原任务目录的授权已失效，请在主窗口重新选择原目录后继续');
+    }
+    if(command.action==='approve'||command.action==='reject'){
+      const pending=this.chatApprovals.get(command.approvalId||''),detail=this.runtimeGraphDetail(command.sessionId,command.nodeId);
+      if(!pending||!entry||pending.requestId!==entry[0]||!detail.approvals?.some(row=>row.id===command.approvalId))throw new Error('批准请求已失效，请刷新');
+      pending.resolve(command.action==='approve','once');return this.runtimeGraphDetail(command.sessionId,command.nodeId);
+    }
+    const applied=controller.command(command);
+    if(applied)this.captureGraph(command.sessionId,entry?.[0]||'configuration',({pause:'申请暂停',continue:'继续执行',step:'单步执行',cancel:'取消执行',draft:'保存节点草稿',apply:'应用节点配置',retry:'重跑依赖分支','template-save':'保存会话模板','template-delete':'删除会话模板',approve:'批准本次调用',reject:'拒绝本次调用'})[command.action],true);
+    if(applied&&command.action==='cancel'&&entry)for(const pending of this.chatApprovals.values()){
+      const scopeId=pending.activity.workerId?controller.session.taskPlan?.items.find(item=>item.worker?.id===pending.activity.workerId)?.id:'main';
+      if(pending.requestId===entry[0]&&scopeId&&controller.isCancelled(scopeId))pending.resolve(false);
+    }
+    if(applied&&command.action==='cancel'&&(command.scope==='all'||command.nodeId==='task:root'||command.nodeId==='agent:coordinator'))entry?.[1].controller.abort(new Error('用户从 3D 工作台取消执行'));
+    if(applied&&command.action==='retry'){
+      const requestId=randomUUID();this.workbenchResumeRequests.add(requestId);
+      try{await this.startChat({sessionId:command.sessionId,requestId,workspaceToken:resumeWorkspaceToken,model:controller.session.model,modelRef:controller.session.modelRef,text:'继续当前已保存的任务，只执行未完成和已标记过期的节点。'},owner)}catch(error){this.workbenchResumeRequests.delete(requestId);throw error}
+    }
+    return this.runtimeGraphDetail(command.sessionId,command.nodeId);
+  }
+  runtimeGraphSnapshot(sessionId?: string) {
+    if (!this.runtimeGraphLoaded) {
+      this.runtimeGraphLoaded = true;
+      const files = existsSync(this.sessionsDirectory) ? readdirSync(this.sessionsDirectory)
+        .filter(file => /^[a-f\d-]{36}\.json$/i.test(file))
+        .map(file => ({file, time:statSync(path.join(this.sessionsDirectory,file)).mtimeMs}))
+        .sort((a,b) => b.time-a.time).slice(0,40) : [];
+      for (const {file} of files) {
+        const session = readIntegrationJson<StudioSession|undefined>(path.join(this.sessionsDirectory,file),undefined);
+        if (session?.id === file.slice(0,-5) && Array.isArray(session.messages)) this.runtimeGraph.remember(session,true);
+      }
+    }
+    if (sessionId && !this.runtimeGraph.has(sessionId)) this.runtimeGraph.remember(this.session(sessionId),true);
+    const graph=this.runtimeGraph.snapshot(sessionId),controller=graph.sessionId?this.workbenches.get(graph.sessionId):undefined;
+    if(!controller?.active)return graph;
+    const inspection=controller.inspector.snapshot();
+    for(const node of graph.nodes){
+      let scopeId:string;try{scopeId=controller.scope(node.id)}catch{continue}
+      const activity=controller.activityView(scopeId,inspection.calls),config=controller.configuration(scopeId);
+      const calls=inspection.calls.filter(call=>(call.scopeId||'main')===scopeId&&(!node.id.startsWith('tool:')||node.id.endsWith(':'+call.name)));
+      const pending=calls.find(call=>call.status==='paused');
+      node.configRevision=config.revision;node.appliedRevision=activity?.appliedRevision;
+      node.pauseRequested=controller.inspector.isPaused(scopeId)&&!pending;
+      if(pending){node.status='paused';node.activity='已暂停 · '+pending.name;node.phase=pending.kind;}
+      else if(activity&&activity.phase!=='finished'&&node.kind!=='tool'){node.activity=activity.label;node.phase=activity.phase;if(node.status==='queued')node.status='running'}
+      if(node.pauseRequested)node.activity='申请暂停 · 等待下一执行边界';
+      if(node.id==='task:root'&&inspection.calls.some(call=>call.status==='paused')&&!inspection.calls.some(call=>call.status==='running'||call.status==='ready')){node.status='paused';node.pauseRequested=false;node.activity='所有当前调用已停在检查点'}
+      if(activity?.cancelled)node.activity='已请求取消 · 等待执行退出';
+      if(pending&&pending.kind==='tool'&&!graph.nodes.some(row=>row.id===`tool:${pending.workerId?'worker:'+pending.workerId:'agent:coordinator'}:${pending.name}`)){
+        const source=pending.workerId?'worker:'+pending.workerId:'agent:coordinator',id=`tool:${source}:${pending.name}`;
+        graph.nodes.push({id,sourceId:pending.name,kind:'tool',label:pending.name.replace(/^agent\./,''),status:'paused',detail:'工具尚未执行，可编辑此调用参数。',activity:'调用前已暂停',lane:4,order:graph.nodes.filter(row=>row.kind==='tool').length,metrics:[{label:'调用 ID',value:pending.id}]});
+        if(graph.nodes.some(row=>row.id===source))graph.edges.push({id:'calls:'+id,source,target:id,kind:'calls',label:'调用前检查',status:'paused'});
+      }
+    }
+    for(const edge of graph.edges){
+      const source=graph.nodes.find(node=>node.id===edge.source),target=graph.nodes.find(node=>node.id===edge.target);
+      if(source?.status==='paused'||target?.status==='paused'){edge.status='paused';edge.activeAt=undefined;edge.returning=false}
+    }
+    for(const event of controller.data.events.slice(-20))graph.events.push({id:event.id,at:event.at,label:event.detail,nodeId:event.scopeId==='main'?'task:root':'task:'+event.scopeId,status:'idle'});
+    for(const call of inspection.calls.slice(-10))graph.events.push({id:call.id+':'+call.status,at:call.finishedAt||call.startedAt||graph.updatedAt,label:call.name,nodeId:call.scopeId&&call.scopeId!=='main'?'task:'+call.scopeId:'task:root',status:call.status==='ready'?'queued':call.status});
+    graph.events.sort((a,b)=>b.at.localeCompare(a.at));graph.events=graph.events.slice(0,60);
+    return graph;
+  }
   private readonly downloads: LocalAiDownloads;
   private readonly runtime: LocalAiRuntime;
   private readonly inspectors=new Map<string,ExecutionInspector>();
@@ -205,8 +396,34 @@ export class LocalAiStudioService extends LocalAiService {
   private readonly inspectedRuns=new Map<string,{owner:number;state:import('../shared/execution-inspector.js').InspectionState}>();
   private readonly chats = new Map<
     string,
-    { owner: number; sessionId: string; controller: AbortController }
+    { owner: number; sessionId: string; controller: AbortController; session:StudioSession;
+      pending:StudioMessage; pendingBound:boolean; startedAt:string; compactOnly:boolean;
+      phase:'starting'|'running'; sequence:number; finished:boolean; localRuntime:boolean; connection:AgentConnection;workspace?:{path:string;token:string} }
   >();
+  private readonly usedChatRequestIds = new Set<string>();
+  private readonly chatOwnerListeners = new Map<number,()=>void>();
+  private trackChatOwner(sender:WebContents) {
+    if(this.chatOwnerListeners.has(sender.id))return;
+    const destroyed=()=>{for(const run of this.chats.values())if(run.owner===sender.id)run.controller.abort();this.chatOwnerListeners.delete(sender.id)};
+    this.chatOwnerListeners.set(sender.id,destroyed);sender.once('destroyed',destroyed);
+  }
+  private releaseChatOwner(sender:WebContents) {
+    if([...this.chats.values()].some(run=>run.owner===sender.id))return;
+    const listener=this.chatOwnerListeners.get(sender.id);
+    if(listener)sender.removeListener('destroyed',listener);
+    this.chatOwnerListeners.delete(sender.id);
+  }
+  chatRuns(owner:number):StudioChatRun[] {
+    return [...this.chats].filter(([,run])=>run.owner===owner&&!run.finished).map(([requestId,run])=>{
+      const approvals=[...this.chatApprovals].filter(([,pending])=>pending.requestId===requestId&&pending.owner===owner).map(([approvalId,pending])=>({approvalId,activity:pending.activity}));
+      const grant=run.workspace?this.agentWorkspaces.get(run.workspace.token):undefined;
+      const workspace=grant&&grant.owner===owner&&grant.path===run.workspace?.path?run.workspace:undefined;
+      return structuredClone({requestId,sessionId:run.sessionId,session:{...run.session,messages:run.session.messages.filter(message=>message.id!==run.pending.id)},pending:run.pending,startedAt:run.startedAt,compactOnly:run.compactOnly,sequence:run.sequence,...(workspace?{workspace}:{}),phase:run.controller.signal.aborted?'stopping':approvals.length?'waiting_approval':run.phase,approvals});
+    });
+  }
+  private assertLocalRuntimeIdle() {
+    if([...this.chats.values()].some(run=>run.localRuntime))throw new Error('本地模型仍被会话使用，请先停止相关会话或等待完成，再卸载或切换模型');
+  }
   private readonly metadata = new Map<
     string,
     { time: number; details: StudioModelDetails }
@@ -242,10 +459,10 @@ export class LocalAiStudioService extends LocalAiService {
   private agentCoreReady: Promise<void> | null = null;
   private readonly coreTaskOwners = new Map<string, WebContents>();
   private readonly coreTaskWorkspaces = new Map<string, string>();
-  private readonly chatApprovals = new Map<string, {requestId:string;owner:number;resolve:(approved:boolean,scope?:'once'|'similar'|'full')=>void}>();
+  private readonly chatApprovals = new Map<string, {requestId:string;owner:number;activity:import('../shared/local-ai-studio.js').StudioToolActivity;resolve:(approved:boolean,scope?:'once'|'similar'|'full')=>void}>();
   private readonly coreApprovals = new Map<string, { taskId: string; resolve: (approved: boolean) => void }>();
   private readonly coreMcpFile: string;
-  private deletingPlugin = false;
+  private mutatingPlugin = false;
   private loadingRuntime = false;
   private stoppingServer = false;
   private catalogCache: Record<string, StudioCatalog> = {};
@@ -278,9 +495,14 @@ export class LocalAiStudioService extends LocalAiService {
     this.preferencesFile = path.join(dataRoot, "local-ai-studio-settings.json");
     this.coreMcpFile = path.join(dataRoot, "agent-core-mcp.json");
     this.sessionsDirectory = path.join(dataRoot, "local-ai-sessions");
+    this.graphHistory=new RuntimeGraphHistory(path.join(dataRoot,'workbench','history'));
+    this.nodeTemplates=new RuntimeTemplateLibrary(path.join(dataRoot,'workbench'));
     this.preferences = readIntegrationJson<
-      Partial<StudioSettings> & { deepseekDefaultsVersion?: number }
+      Partial<StudioSettings> & { deepseekDefaultsVersion?: number; managedContextLength?: number }
     >(this.preferencesFile, {});
+    // Preserve legacy local settings before any remote-provider migration.
+    this.preferences.managedContextLength ??= this.preferences.source === 'managed'
+      ? this.preferences.contextLength ?? 4096 : 4096;
     const saved = super.settings();
     if (
       isDeepSeek(saved.endpoint) &&
@@ -466,7 +688,7 @@ export class LocalAiStudioService extends LocalAiService {
           await this.startRuntime(id, options);
           return this.runtime.snapshot();
         },
-        unload: () => this.runtime.stop(),
+        unload: () => { this.assertLocalRuntimeIdle(); return this.runtime.stop(); },
         files: (repo) => this.files(repo),
         enqueue: (repo, file) => this.enqueue({ repoId: repo, file }),
         downloads: () => this.downloads.list(),
@@ -474,6 +696,15 @@ export class LocalAiStudioService extends LocalAiService {
       path.join(dataRoot, "local-ai-api-download-jobs.json"),
       (level, message) => log?.(level, "local-api", message),
     );
+    try{
+      this.nodeMonitor=new NodeMonitor(path.join(dataRoot,'workbench'),{
+        analyze:(issue,signal)=>this.analyzeMonitor(issue,signal),
+        repair:(issue,policy,signal,onPhase)=>this.repairMonitor(issue,policy,signal,onPhase),
+        moduleSnapshots:()=>[this.abilityModules,this.selectionModule,this.routerModule,...this.policyManagers.values()].map(manager=>manager.snapshot()),
+        onError:message=>log?.('warn','node-monitor',message),
+      });
+      this.scanMonitorSessions();
+    }catch(error){this.nodeMonitorError='节点监控初始化失败，原监控存档已保留，其他会话仍可使用：'+String(error);log?.('warn','node-monitor',this.nodeMonitorError)}
   }
 
   private async compileSkillCode(source: string): Promise<void> {
@@ -494,6 +725,13 @@ export class LocalAiStudioService extends LocalAiService {
   private async initializeSkills() {
     await this.ensureAgentCore()
   }
+  private assertPluginReloadIdle(){
+    this.assertPluginsAvailable();
+    const status=this.agentCoreService?.getStatus();
+    if(this.chats.size||this.coreTaskOwners.size||status?.runningTasks||status?.runningConversations)throw new Error('请等待所有 AI 会话和 Agent 任务结束后再保存或重新加载插件');
+  }
+  private assertPluginsAvailable(){if(this.mutatingPlugin)throw new Error('插件正在更新，请完成后再启动任务或修改插件')}
+  private beginPluginMutation(){this.assertPluginReloadIdle();this.mutatingPlugin=true}
 
   private async ensureAgentCore(): Promise<AgentCoreService> {
     if (!this.agentCoreReady) {
@@ -555,6 +793,7 @@ export class LocalAiStudioService extends LocalAiService {
           dataDir,
           skillsDir,
           getConnection: () => this.agentConnection(),
+          assertCanStartRun: () => this.assertPluginsAvailable(),
           abilityPolicies: this.abilityPolicies,
           diagnosticLog: message => this.applicationLog?.('error', 'agent-core', message)
         })
@@ -594,9 +833,10 @@ export class LocalAiStudioService extends LocalAiService {
       source,
       runtimePath: textValue(p.runtimePath, 2000),
       runtimePort: Math.round(numeric(p.runtimePort, 1024, 65535, 8089)),
+      managedContextLength: Math.round(numeric(p.managedContextLength, 512, 131072, 4096)),
       contextLength: Math.round(
         numeric(
-          p.contextLength,
+          source === 'managed' ? p.managedContextLength : p.contextLength,
           512,
           contextMaximum,
           source === "external" && isDeepSeek(base.endpoint)
@@ -624,9 +864,7 @@ export class LocalAiStudioService extends LocalAiService {
         : "minimal",
     };
   }
-  private inferenceSettings(model?: string): StudioSettings {
-    const settings = this.studioSettings(),
-      runtime = this.runtime.snapshot();
+  private inferenceSettings(model?: string, settings = this.studioSettings(), runtime = this.runtime.snapshot(), remoteModels = this.remoteModelCache()): StudioSettings {
     let contextLength =
       settings.source === "managed" &&
       runtime.contextLength &&
@@ -635,7 +873,7 @@ export class LocalAiStudioService extends LocalAiService {
         : settings.contextLength;
     const selected = model || settings.model;
     if (settings.source === 'external' && selected) {
-      const cached = this.remoteModelCache().find(row => row.apiFormat === settings.apiFormat && row.endpoint.replace(/\/$/, '') === settings.endpoint.replace(/\/$/, ''))
+      const cached = remoteModels.find(row => row.apiFormat === settings.apiFormat && row.endpoint.replace(/\/$/, '') === settings.endpoint.replace(/\/$/, ''))
         ?.models.find(item => item.id === selected || item.instanceId === selected);
       if (cached?.contextLength && Number.isFinite(cached.contextLength)) contextLength = Math.min(contextLength, cached.contextLength);
       contextLength = modelCapacity({endpoint:settings.endpoint,apiFormat:settings.apiFormat,key:'',maxTokens:settings.maxTokens,contextLength}, selected);
@@ -671,12 +909,13 @@ export class LocalAiStudioService extends LocalAiService {
       throw new Error('背景图片格式无效或文件过大');
     if (value.backgroundOpacity !== undefined) value.backgroundOpacity = backgroundOpacity(value.backgroundOpacity);
     if (value.appearance !== undefined) value.appearance = normalizeAppearance(value.appearance);
-    super.saveSettings(value);
+    // Local runtime budgets must never update the saved remote API profile.
+    const targetSource = value.source ?? previous.source;
+    super.saveSettings(targetSource === 'managed' ? { ...value, contextLength: undefined } : value);
     const keys = [
       "source",
       "runtimePath",
       "runtimePort",
-      "contextLength",
       "gpuLayers",
       "threads",
       "showTokenSpeed",
@@ -693,6 +932,16 @@ export class LocalAiStudioService extends LocalAiService {
       "backgroundOpacity",
     ] as const;
     const candidate = { ...this.preferences };
+    if (value.managedContextLength !== undefined)
+      candidate.managedContextLength = Math.round(numeric(value.managedContextLength, 512, 131072, previous.managedContextLength ?? 4096));
+    if (value.contextLength !== undefined) {
+      if (targetSource === 'managed') candidate.managedContextLength = value.contextLength;
+      else candidate.contextLength = value.contextLength;
+    } else if (targetSource === 'external' && previous.source === 'managed') {
+      const current = super.settings();
+      const profile = this.storedProfiles().find(row => row.apiFormat === current.apiFormat && row.endpoint === current.endpoint);
+      if (profile) candidate.contextLength = profile.contextLength;
+    }
     for (const key of keys)
       if (value[key] !== undefined)
         Object.assign(candidate, { [key]: value[key] });
@@ -763,6 +1012,50 @@ export class LocalAiStudioService extends LocalAiService {
       localLlama: settings.source === "managed",
     };
   }
+  private remoteModelService(ref:Extract<WorkflowModelRef,{source:'remote'}>) {
+    const address=endpoint(ref.endpoint),profiles=this.storedProfiles();
+    const profile=ref.profileId?profiles.find(item=>item.id===ref.profileId):profiles.find(item=>item.apiFormat===ref.apiFormat&&endpoint(item.endpoint)===address);
+    if(ref.profileId&&(!profile||profile.apiFormat!==ref.apiFormat||endpoint(profile.endpoint)!==address))throw new Error('远程配置已删除或服务地址发生变化，请重新选择模型');
+    const current=this.config();
+    const encryptedKey=profile?.encryptedApiKey??(current.apiFormat===ref.apiFormat&&endpoint(current.endpoint)===address?current.encryptedApiKey:'');
+    return {service:{apiFormat:ref.apiFormat,endpoint:address,key:encryptedKey?this.decrypt(encryptedKey):''},profile};
+  }
+  private chatModel(model:string,input:unknown) {
+    const defaults=this.studioSettings(),runtime=this.runtime.snapshot();
+    const value=input===undefined?undefined:record(input);
+    if(value&&!['current','local','remote'].includes(String(value.source)))throw new Error('模型来源无效，请重新选择');
+    if(value?.source==='local'){
+      const id=required(value.id,'本地模型 ID',500);
+      if(runtime.state!=='running'||runtime.modelId!==id)throw new Error('此会话选择的本地模型尚未加载或已经切换，请重新加载并选择模型');
+      const name=runtime.modelName;
+      return {model:name,modelRef:{source:'local',id,name} as WorkflowModelRef,settings:{...defaults,source:'managed' as const,contextLength:defaults.managedContextLength??defaults.contextLength},service:{apiFormat:'openai' as const,endpoint:this.gateway.endpoint||`http://127.0.0.1:${defaults.runtimePort}/v1`,key:this.gateway.apiKey}};
+    }
+    if(value?.source==='remote'){
+      if(!['openai','anthropic'].includes(String(value.apiFormat)))throw new Error('模型 API 协议无效');
+      const ref:Extract<WorkflowModelRef,{source:'remote'}>={source:'remote',id:required(value.id,'远程模型 ID',500),apiFormat:value.apiFormat as 'openai'|'anthropic',endpoint:endpoint(required(value.endpoint,'模型服务地址',1000)),...(textValue(value.profileId)?{profileId:textValue(value.profileId)}:{}),...(textValue(value.name)?{name:textValue(value.name,500)}:{})};
+      if(value.contextLength!==undefined){if(!Number.isSafeInteger(value.contextLength)||Number(value.contextLength)<512||Number(value.contextLength)>1_000_000)throw new Error('模型上下文长度无效');ref.contextLength=Number(value.contextLength)}
+      const {service,profile}=this.remoteModelService(ref);
+      const settings={...defaults,source:'external' as const,apiFormat:ref.apiFormat,endpoint:ref.endpoint,model:ref.id,contextLength:ref.contextLength||profile?.contextLength||defaults.contextLength};
+      return {model:ref.id,modelRef:{...ref,...(profile?{profileId:profile.id}:{})} as WorkflowModelRef,settings,service};
+    }
+    const service=this.service();
+    const profile=defaults.source==='external'?this.storedProfiles().find(item=>item.apiFormat===service.apiFormat&&endpoint(item.endpoint)===service.endpoint):undefined;
+    const modelRef:WorkflowModelRef=defaults.source==='managed'?{source:'local',id:runtime.modelId,name:runtime.modelName}:{source:'remote',id:model,apiFormat:service.apiFormat,endpoint:service.endpoint,contextLength:defaults.contextLength,...(profile?{profileId:profile.id}:{})};
+    return {model,modelRef,settings:defaults,service};
+  }
+  private chatGenerationSettings(settings:StudioSettings,input:unknown):StudioSettings {
+    if(input===undefined)return settings;
+    if(!input||typeof input!=='object'||Array.isArray(input))throw new Error('生成参数必须是对象');
+    const value=record(input),ranges={temperature:[0,2],topP:[0.01,1],maxTokens:[128,LOCAL_AI_MAX_OUTPUT_TOKENS],repeatPenalty:[0.1,2]} as const;
+    if(Object.keys(value).some(key=>!(key in ranges)))throw new Error('生成参数包含不支持的字段');
+    const next={...settings};
+    for(const key of Object.keys(ranges) as Array<keyof typeof ranges>){
+      const candidate=value[key],[minimum,maximum]=ranges[key];
+      if(typeof candidate!=='number'||!Number.isFinite(candidate)||candidate<minimum||candidate>maximum||(key==='maxTokens'&&!Number.isSafeInteger(candidate)))throw new Error(`生成参数 ${key} 必须在 ${minimum} 至 ${maximum} 范围内${key==='maxTokens'?'且为整数':''}`);
+      next[key]=candidate;
+    }
+    return next;
+  }
   private async prepareWorkflowModel(ref?: WorkflowModelRef, legacyModel?: string) {
     if (!ref || ref.source === "current") {
       const model = ref?.id || legacyModel || (await this.workflowCurrentModel());
@@ -790,26 +1083,14 @@ export class LocalAiStudioService extends LocalAiService {
         connection: this.agentConnection({ ...this.inferenceSettings(), source: "managed" }),
       };
     }
-    const endpointValue = endpoint(ref.endpoint),
-      profiles = this.storedProfiles(),
-      profile =
-        (ref.profileId && profiles.find((item) => item.id === ref.profileId)) ||
-        profiles.find((item) => item.apiFormat === ref.apiFormat && endpoint(item.endpoint) === endpointValue),
-      current = this.config(),
-      encryptedApiKey =
-        profile?.encryptedApiKey ||
-        (current.apiFormat === ref.apiFormat && endpoint(current.endpoint) === endpointValue
-          ? current.encryptedApiKey
-          : ""),
+    const {service,profile}=this.remoteModelService(ref),
       settings = this.inferenceSettings();
     return {
       model: ref.id || legacyModel || profile?.model || "",
       source: "remote" as const,
       label: ref.name || ref.id,
       connection: {
-        apiFormat: ref.apiFormat,
-        endpoint: endpointValue,
-        key: encryptedApiKey ? this.decrypt(encryptedApiKey) : "",
+        ...service,
         maxTokens: settings.maxTokens,
         contextLength: ref.contextLength || profile?.contextLength || settings.contextLength,
         localLlama: false,
@@ -1384,6 +1665,7 @@ export class LocalAiStudioService extends LocalAiService {
     return this.runtimeSnapshot();
   }
   async startRuntime(id: string, options: RuntimeLoadOptions = {}) {
+    this.assertLocalRuntimeIdle();
     if (this.loadingRuntime || this.stoppingServer)
       throw new Error("运行时正在切换，请稍后重试");
     this.loadingRuntime = true;
@@ -1439,6 +1721,7 @@ export class LocalAiStudioService extends LocalAiService {
     }
   }
   async stopRuntime() {
+    this.assertLocalRuntimeIdle();
     this.stoppingServer = true;
     try {
       await this.gateway.stop();
@@ -1452,6 +1735,7 @@ export class LocalAiStudioService extends LocalAiService {
     const value = record(input),
       id = required(value.id, "模型 ID"),
       service = this.service();
+    if([...this.chats.values()].some(run=>run.connection.endpoint.replace(/\/$/,'')===service.endpoint.replace(/\/$/,'')))throw new Error('此模型服务仍被会话使用，请等待相关会话完成后再加载或卸载模型');
     if (this.studioSettings().source !== "external")
       throw new Error("请切换至外部服务");
     const status = await this.connect("model-operation");
@@ -1470,9 +1754,26 @@ export class LocalAiStudioService extends LocalAiService {
     if (!/^[a-f\d-]{36}$/i.test(id)) throw new Error("会话 ID 无效");
     return path.join(this.sessionsDirectory, `${id}.json`);
   }
+  private defaultChatWorkspace(session: StudioSession): NonNullable<StudioSession['defaultWorkspace']> {
+    const project = session.projectId ? this.agent.projects().find(item => item.id === session.projectId) : undefined;
+    this.sessionFile(session.id);
+    return project
+      ? {kind: 'project', path: project.workspace}
+      : {kind: 'cache', path: path.join(this.dataRoot, 'cache', 'tasks', session.id)};
+  }
+  private ensureCacheWorkspace(sessionId?: string) {
+    if (sessionId) this.sessionFile(sessionId);
+    const storage = new AgentWorkspace(this.dataRoot);
+    const relative = sessionId ? `cache/tasks/${sessionId}` : 'cache/tools';
+    mkdirSync(storage.resolve(relative, true), {recursive: true});
+    return new AgentWorkspace(storage.resolve(relative)).root;
+  }
   private saveSession(session: StudioSession) {
+    session.defaultWorkspace = this.defaultChatWorkspace(session);
     session.updatedAt = new Date().toISOString();
     writeIntegrationJson(this.sessionFile(session.id), session);
+    this.runtimeGraph.remember(session);
+    this.observeMonitor(session);
     return session;
   }
   sessions(): StudioSessionSummary[] {
@@ -1480,13 +1781,15 @@ export class LocalAiStudioService extends LocalAiService {
     return readdirSync(this.sessionsDirectory)
       .filter((file) => /^[a-f\d-]{36}\.json$/i.test(file))
       .map((file) => this.session(file.slice(0, -5)))
-      .map(({ messages, abilityState: _abilityState, operationJournal: _operationJournal, ...rest }) => ({
+      .map(({ messages, abilityState: _abilityState, operationJournal: _operationJournal, workbench: _workbench, ...rest }) => ({
         ...rest,
         messageCount: messages.length,
       }))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
   session(id: string): StudioSession {
+    const live=[...this.chats.values()].find(run=>run.sessionId===id);
+    if(live)return structuredClone(live.session);
     const file = this.sessionFile(id);
     if (!existsSync(file)) throw new Error("会话不存在");
     const session = readIntegrationJson<StudioSession>(
@@ -1495,6 +1798,9 @@ export class LocalAiStudioService extends LocalAiService {
     );
     if (session.id !== id || !Array.isArray(session.messages))
       throw new Error("会话文件格式错误");
+    // Derive this from trusted configuration, including for sessions saved before
+    // cache workspaces existed. Never use a persisted path as authorization.
+    session.defaultWorkspace = this.defaultChatWorkspace(session);
     const conversationBoundary=session.taskPlan?.scope?.goal?legacyWeatherIdentityBoundary(session.taskPlan.scope.goal,session.messages):undefined;
     if(conversationBoundary){
       session.conversationStartMessageId=conversationBoundary;
@@ -1588,29 +1894,30 @@ export class LocalAiStudioService extends LocalAiService {
     if ([...this.chats.values()].some((item) => item.sessionId === id))
       throw new Error("请先停止生成再删除会话");
     unlinkSync(this.sessionFile(id));
+    this.monitorSessionOwners.delete(id);
+    this.runtimeGraph.remove(id);
+    this.graphHistory.remove(id);this.graphHistoryErrors.delete(id);
   }
   stopChat(requestId: string, owner: number) {
     const chat = this.chats.get(requestId);
     if (chat?.owner === owner) chat.controller.abort();
   }
   async startChat(input: unknown, sender: WebContents, compactOnly = false) {
+    this.assertPluginsAvailable();
     const value = record(input),
       requestId = required(value.requestId, "请求 ID", 100),
-      session = this.session(required(value.sessionId, "会话 ID"));
-    if (
-      this.chats.has(requestId) ||
-      [...this.chats.values()].some(
-        (item) => item.owner === sender.id || item.sessionId === session.id,
-      )
-    )
-      throw new Error("请先等待当前生成完成");
+      sessionId = required(value.sessionId, "会话 ID");
+    if(this.usedChatRequestIds.has(requestId)||this.chats.has(requestId))throw new Error('请求 ID 已使用，请重新发起');
+    if([...this.chats.values()].some(item=>item.sessionId===sessionId))throw new Error('此会话正在生成，请等待完成或停止后再发送');
+    if(sender.isDestroyed())throw new Error('会话窗口已关闭');
+    const session = this.session(sessionId);
     const approvalMode = value.approvalMode ?? session.approvalMode ?? 'ask';
     if (!['ask', 'auto', 'full'].includes(String(approvalMode))) throw new Error('无效的权限模式');
     const workspaceToken = textValue(value.workspaceToken);
     const grant = workspaceToken ? this.agentWorkspaces.get(workspaceToken) : undefined;
     if (workspaceToken && (!grant || grant.owner !== sender.id)) throw new Error('工作目录授权已失效，请重新选择');
     const project = session.projectId ? this.agent.projects().find(item => item.id === session.projectId) : undefined;
-    const workspace = grant ? new AgentWorkspace(grant.path).root : project ? new AgentWorkspace(project.workspace).root : os.homedir();
+    const workspace = grant ? new AgentWorkspace(grant.path).root : project ? new AgentWorkspace(project.workspace).root : this.ensureCacheWorkspace(session.id);
     if (grant && workspace !== grant.path) throw new Error('工作目录位置已改变，请重新选择');
     if (!compactOnly) {
       session.approvalMode = approvalMode as 'ask'|'auto'|'full';
@@ -1627,18 +1934,26 @@ export class LocalAiStudioService extends LocalAiService {
     if(value.regenerate===true&&session.messages.filter(message=>message.role==='user').at(-1)?.visualDecision)throw new Error('验收选择已保存，请发送继续或重新截图，不要重新生成已提交的验收选择');
     const visualDecision=value.visualDecision===undefined?undefined:validateVisualDecision(session.taskPlan,session.messages,value.visualDecision);
     if(visualDecision&&(compactOnly||value.regenerate===true||session.taskPlan?.workspace!==workspace||!session.abilityTask||session.taskPlan.taskId!==session.abilityTask.id))throw new Error('验收任务或工作目录已变化，请刷新后继续');
-    const model = required(value.model, "模型", 500),
+    const resolved = this.chatModel(required(value.model, "模型", 500),value.modelRef),
+      model = resolved.model,
       content = visualDecision?visualDecisionText(session.taskPlan!.items.find(item=>item.id===visualDecision.itemId)!,visualDecision):textValue(value.text, 100000).trim(),
-      settings = this.inferenceSettings(model),
-      service = this.service();
+      baseSettings = this.chatGenerationSettings(resolved.settings,value.generation),
+      runtimeState = this.runtime.snapshot(),
+      remoteModels = this.remoteModelCache(),
+      settings = this.inferenceSettings(model,baseSettings,runtimeState,remoteModels),
+      service = resolved.service;
+    const localEndpoint = new URL(service.endpoint);
+    const runtimePorts=[String(baseSettings.runtimePort),...(runtimeState.endpoint?[new URL(runtimeState.endpoint).port]:[])];
+    const localRuntime = settings.source==='managed'||(['127.0.0.1','localhost','[::1]'].includes(localEndpoint.hostname)&&runtimePorts.includes(localEndpoint.port));
+    if(localRuntime&&(this.loadingRuntime||this.stoppingServer))throw new Error('本地模型服务正在切换，请就绪后重试');
     if (
       settings.source === "managed" &&
-      this.runtime.snapshot().state !== "running"
+      runtimeState.state !== "running"
     )
       throw new Error("请先在我的模型中加载模型，等待运行状态变为就绪");
     if (
       settings.source === "managed" &&
-      !this.runtime.snapshot().vision &&
+      !runtimeState.vision &&
       (images.length ||
         session.messages.some((message) => message.images?.length))
     )
@@ -1681,22 +1996,65 @@ export class LocalAiStudioService extends LocalAiService {
     )
       delete session.checkpoint;
     session.model = model;
+    session.modelRef = resolved.modelRef;
     this.saveSession(session);
     const controller = new AbortController();
-    const inspector=new ExecutionInspector(controller.signal,settings.showExecutionInspector===true&&settings.pauseBeforeAgentCalls===true);
-    this.inspectors.set(requestId,inspector);
-    this.chats.set(requestId, {
-      owner: sender.id,
-      sessionId: session.id,
-      controller,
+    const inspector=new ExecutionInspector(controller.signal,settings.showExecutionInspector===true&&settings.pauseBeforeAgentCalls===true,label=>this.captureGraph(session.id,requestId,label));
+    const workbench=new RuntimeWorkbench(session,inspector,()=>this.saveSession(session),name=>{
+      const selected=this.inferenceSettings(name,baseSettings,runtimeState,remoteModels);
+      if(localRuntime&&name!==model)throw new Error('本地 llama-server 当前只加载一个模型，请先在我的模型中切换，再重试节点');
+      return {...service,maxTokens:selected.maxTokens,contextLength:selected.contextLength,localLlama:localRuntime};
     });
-    const destroyed = () => controller.abort();
-    sender.once("destroyed", destroyed);
-    const emit = (event: StudioEvent) => {
+    const startedAt=new Date().toISOString();
+    const run = {
+      owner: sender.id, sessionId: session.id, controller, session,
+      pending:{id:randomUUID(),role:'assistant' as const,content:'',reasoning:'',createdAt:startedAt,model},
+      pendingBound:false,startedAt,compactOnly,sequence:0,phase:'starting' as 'starting'|'running',finished:false,
+      localRuntime,connection:{...service,maxTokens:settings.maxTokens,contextLength:settings.contextLength,localLlama:localRuntime},
+      ...(grant?{workspace:{path:workspace,token:workspaceToken}}:{}),
+    };
+    // All validation and reservation above is synchronous: no second IPC request
+    // can pass the same-session guard before this entry becomes visible.
+    this.workbenches.set(session.id,workbench);
+    this.inspectors.set(requestId,inspector);
+    this.chats.set(requestId,run);
+    this.monitorSessionOwners.set(session.id,sender);
+    this.observeMonitor(session,true);
+    this.usedChatRequestIds.add(requestId);
+    this.trackChatOwner(sender);
+    const emit = (payload: StudioEventPayload) => {
+      if(run.finished)return;
+      const event:StudioEvent={...payload,requestId,sessionId:session.id,sequence:++run.sequence};
+      run.phase='running';
+      if(event.type==='task-plan')session.taskPlan=event.plan;
+      if(event.type==='context')session.context=event.context;
+      if((event.type==='context'||event.type==='delta')&&event.sessionUsage)session.usage=event.sessionUsage;
+      // Production generate binds its answer directly; retaining the event
+      // reducer also supports alternate producers without duplicating deltas.
+      if(!run.pendingBound){
+        const answer:StudioMessage=run.pending;
+        if(event.type==='delta'){answer.content+=event.content;answer.reasoning=(answer.reasoning||'')+event.reasoning;if(event.usage)answer.usage=event.usage}
+        if(event.type==='progress'){answer.execution??=[];answer.execution.push(event.entry)}
+        if(event.type==='outcome')answer.outcome=event.outcome;
+        if(event.type==='tool'){
+          answer.toolActivity??=[];const index=answer.toolActivity.findIndex(row=>row.id===event.activity.id);
+          if(index>=0)answer.toolActivity[index]=event.activity;else{answer.toolActivity.push(event.activity);answer.execution??=[];answer.execution.push({id:event.activity.id,type:'tool',activityId:event.activity.id,createdAt:new Date().toISOString()})}
+        }
+      }
+      if(event.type==='finished')run.finished=true;
+      if(['task-plan','tool','error','outcome','finished'].includes(event.type))this.observeMonitor(session,true);
+      this.runtimeGraph.event(session.id,event);
+      if(event.type==='task-plan'||event.type==='tool'||event.type==='progress'||event.type==='approval'||event.type==='finished')this.captureGraph(session.id,requestId,({ 'task-plan':'任务计划更新',tool:'工具状态更新',progress:'执行进度更新',approval:'等待用户授权',finished:'执行结果已保存'})[event.type]);
       if (!sender.isDestroyed()) sender.send("local-ai:studio-event", event);
     };
     const approvalGrants = new ChatApprovalGrants();
-    void this.generate(
+    try{
+      this.runtimeGraph.start(session,requestId);
+      this.captureGraph(session.id,requestId,'开始执行',true);
+    }catch(error){
+      this.chats.delete(requestId);this.releaseChatOwner(sender);this.inspectors.delete(requestId);workbench.finish();this.workbenches.delete(session.id);throw error;
+    }
+    const completion=Promise.resolve().then(()=>this.generate(
       session,
       service,
       settings,
@@ -1705,9 +2063,10 @@ export class LocalAiStudioService extends LocalAiService {
       requestId,
       compactOnly,
       {
-        workspace, initializeLocalGit: !!grant || !!project, filesEnabled: !!grant || !!project || approvalMode === 'full', webEnabled: !!session.webEnabled, webAllowSyntheticIp:project?.webAllowSyntheticIp!==false,
+        workspace, initializeLocalGit: !!grant || !!project, filesEnabled: true, webEnabled: !!session.webEnabled, webAllowSyntheticIp:project?.webAllowSyntheticIp!==false,
         approvalMode: session.approvalMode || 'ask',
-        inspectTool:(capability,args,id)=>inspector.before('tool',capability.name,capability.source.type==='skill'?`插件 · ${capability.source.skillId}`:capability.source.type==='mcp'?`MCP · ${capability.source.serverId}`:'内置工具',args,capability.parameters,id),
+        workbench,
+        inspectTool:(capability,args,id,context,signal)=>workbench.inspectTool(capability,args,id,context?.itemId||'main',context?.workerId,signal),
         getApprovalMode: () => session.approvalMode || 'ask',
         approvalGranted: activity => approvalGrants.allows(activity),
         approve: activity => new Promise<boolean>(resolve => {
@@ -1723,18 +2082,26 @@ export class LocalAiStudioService extends LocalAiService {
           };
           const abort = () => finish(false);
           controller.signal.addEventListener('abort', abort, {once:true});
-          this.chatApprovals.set(approvalId, {requestId, owner:sender.id, resolve:finish});
+          this.chatApprovals.set(approvalId, {requestId, owner:sender.id, activity, resolve:finish});
           emit({type:'approval', requestId, approvalId, activity});
         })
       },
-    ).finally(() => {
-      sender.removeListener("destroyed", destroyed);
+    )).catch(cause=>{
+      emit({type:'finished',requestId,session,error:String(cause)});
+    }).finally(() => {
+      this.runtimeGraph.finish(session.id,requestId);
       this.chats.delete(requestId);
+      this.observeMonitor(session,false);
+      this.releaseChatOwner(sender);
       this.inspectedRuns.set(requestId,{owner:sender.id,state:inspector.finish()});
+      workbench.finish();this.workbenches.delete(session.id);this.workbenchResumeRequests.delete(requestId);
+      this.captureGraph(session.id,requestId,'本轮执行结束',true);
       while(this.inspectedRuns.size>8)this.inspectedRuns.delete(this.inspectedRuns.keys().next().value!);
       this.inspectors.delete(requestId);
       for (const pending of this.chatApprovals.values()) if (pending.requestId === requestId) pending.resolve(false);
     });
+    this.chatCompletions.set(requestId,completion);
+    void completion.finally(()=>this.chatCompletions.delete(requestId)).catch(error=>this.applicationLog?.('warn','node-monitor','会话结束清理失败：'+String(error)));
     return { started: true };
   }
   private chatHistory(session: StudioSession): ContextMessage[] {
@@ -1772,7 +2139,7 @@ export class LocalAiStudioService extends LocalAiService {
     },
     settings: StudioSettings,
     signal: AbortSignal,
-    emit: (event: StudioEvent) => void,
+    emit: (event: StudioEventPayload) => void,
     requestId: string,
     force = false,
     aggressive = false,
@@ -1882,10 +2249,10 @@ export class LocalAiStudioService extends LocalAiService {
     },
     settings: StudioSettings,
     signal: AbortSignal,
-    emit: (event: StudioEvent) => void,
+    emit: (event: StudioEventPayload) => void,
     requestId: string,
     compactOnly = false,
-    toolOptions?: Pick<ChatRunOptions, 'workspace'|'initializeLocalGit'|'filesEnabled'|'webEnabled'|'webAllowSyntheticIp'|'approvalMode'|'approve'|'getApprovalMode'|'approvalGranted'|'inspectTool'>,
+    toolOptions?: Pick<ChatRunOptions, 'workspace'|'initializeLocalGit'|'filesEnabled'|'webEnabled'|'webAllowSyntheticIp'|'approvalMode'|'approve'|'getApprovalMode'|'approvalGranted'|'inspectTool'|'workbench'>,
   ) {
     const started = Date.now(),
       answer: StudioMessage = {
@@ -1897,9 +2264,12 @@ export class LocalAiStudioService extends LocalAiService {
         model: session.model,
         status: "complete",
       };
+    const activeRun=this.chats.get(requestId);
+    if(activeRun){activeRun.pending=answer;activeRun.pendingBound=true}
     let error = "";
     let lastSave = Date.now();
     let taskRunId: string | undefined;
+    let explicitTaskResume = false;
     const logScope =
       settings.source === "managed" ? "local-service" : "remote-service";
     this.applicationLog?.(
@@ -1939,7 +2309,8 @@ export class LocalAiStudioService extends LocalAiService {
         }
         const currentGoal=session.taskPlan?.scope?.goal||session.messages.find(message=>message.id===session.abilityTask?.goalMessageId)?.content||'';
         const lookupChange=!latest.visualDecision&&!latest.images?.length?lookupBoundary(latest.content,currentGoal):undefined;
-        const relation=session.abilityTask&&!latest.visualDecision&&!latest.images?.length&&!explicitNewTask(latest.content)&&!lookupChange?await classifyTaskRelation({goal:currentGoal,latest:latest.content,recent:session.messages.slice(-5,-1).map(message=>message.content)},async(system,user)=>{
+        const workbenchResume=this.workbenchResumeRequests.has(requestId)&&!!session.abilityTask&&session.taskPlan?.taskId===session.abilityTask.id;
+        const relation=workbenchResume?'same':session.abilityTask&&!latest.visualDecision&&!latest.images?.length&&!explicitNewTask(latest.content)&&!lookupChange?await classifyTaskRelation({goal:currentGoal,latest:latest.content,recent:session.messages.slice(-5,-1).map(message=>message.content)},async(system,user)=>{
           session.usage!.requests++;
           let previous:TokenUsage|undefined;
           const answer=await requestAgentModel({...service,contextLength:settings.contextLength,maxTokens:Math.min(settings.maxTokens,256),localLlama:settings.source==='managed'},session.model,[{role:'system',content:system},{role:'user',content:user}],signal,{tools:false,thinking:false,temperature:0,onUsage:usage=>{updateTokenUsageTotals(session.usage!,previous,usage);previous=usage}});
@@ -1968,8 +2339,9 @@ export class LocalAiStudioService extends LocalAiService {
         let routingInput: RouterInput = { messages: [{id: latest.id, text: latest.content}], intent: latest.visualDecision?'continue':proposedState?.proposal.intent || 'question', taskStatus: session.abilityTask?.status || 'none', hasAttachments: !!latest.images?.length,relation };
         const overviewQuestion=projectOverviewQuestion(latest.content);
         const independentConversation=!latest.visualDecision&&!latest.images?.length&&!explicitNewTask(latest.content)&&!lookupChange&&!projectChange&&ordinaryConversationMessage(latest.content,routingInput.intent)&&(overviewQuestion||relation==='new'||!session.abilityTask);
-        const routed = latest.visualDecision?{output:{action:'continue'},versionId:'host-visual-review'}:lookupChange?{output:{action:lookupChange==='replace'&&session.abilityTask?'amend':'new_task'},versionId:'host-lookup-boundary'}:independentConversation?{output:{action:'respond'},versionId:'host-conversation'}:relation==='new'?{output:{action:'new_task'},versionId:'host-topic-boundary'}:projectChange?{output:{action:'new_task'},versionId:'host-project-boundary'}:implementAdvice?{output:{action:'amend'},versionId:'host-advice-implementation'}:await inspectModule('task-message-router',routingInput,value=>{routingInput=value;return this.routerModule.execute(value,signal)},{...moduleSchema,properties:{...moduleSchema.properties,intent:{type:'string'},taskStatus:{const:routingInput.taskStatus},hasAttachments:{const:routingInput.hasAttachments},relation:{type:'string'}},required:['messages','intent','taskStatus','hasAttachments']});
+        const routed = workbenchResume?{output:{action:'continue'},versionId:'host-workbench-resume'}:latest.visualDecision?{output:{action:'continue'},versionId:'host-visual-review'}:lookupChange?{output:{action:lookupChange==='replace'&&session.abilityTask?'amend':'new_task'},versionId:'host-lookup-boundary'}:independentConversation?{output:{action:'respond'},versionId:'host-conversation'}:relation==='new'?{output:{action:'new_task'},versionId:'host-topic-boundary'}:projectChange?{output:{action:'new_task'},versionId:'host-project-boundary'}:implementAdvice?{output:{action:'amend'},versionId:'host-advice-implementation'}:await inspectModule('task-message-router',routingInput,value=>{routingInput=value;return this.routerModule.execute(value,signal)},{...moduleSchema,properties:{...moduleSchema.properties,intent:{type:'string'},taskStatus:{const:routingInput.taskStatus},hasAttachments:{const:routingInput.hasAttachments},relation:{type:'string'}},required:['messages','intent','taskStatus','hasAttachments']});
         const route = validateRouterOutput(routed.output, routingInput);
+        explicitTaskResume = route.action === 'continue';
         if(lookupChange==='new_task'){
           try{
             const sample={...routingInput,messages:routingInput.messages.map(message=>({id:'current',text:message.text}))}
@@ -2064,8 +2436,10 @@ export class LocalAiStudioService extends LocalAiService {
           core.importLegacyOperation(taskRunId!,toolOptions!.workspace,capability.name,args,session.operationJournal?.[key]);
           return undefined;
         } : undefined,
-        planExecution: taskRunId ? {goal:(()=>{const base=session.taskPlan?.scope?.goal||session.messages.find(message=>message.id===session.abilityTask?.goalMessageId)?.content||'';const latest=session.messages.filter(message=>message.role==='user').at(-1)?.content||'';return session.taskPlan?.needsReplan&&latest&&!base.split('\n用户补充：').includes(latest)?base+'\n用户补充：'+latest:base})(),taskId:taskRunId,plan:session.taskPlan,save:plan=>{session.taskPlan=plan;this.saveSession(session);emit({type:'task-plan',requestId,plan})}} : undefined,
-        stateContext: moduleContext,
+        planExecution: taskRunId ? {goal:(()=>{const base=session.taskPlan?.scope?.goal||session.messages.find(message=>message.id===session.abilityTask?.goalMessageId)?.content||'';const latest=session.messages.filter(message=>message.role==='user').at(-1)?.content||'';return session.taskPlan?.needsReplan&&latest&&!base.split('\n用户补充：').includes(latest)?base+'\n用户补充：'+latest:base})(),taskId:taskRunId,plan:session.taskPlan,resume:explicitTaskResume,save:plan=>{session.taskPlan=plan;this.saveSession(session);emit({type:'task-plan',requestId,plan})}} : undefined,
+        stateContext: [moduleContext, session.defaultWorkspace?.kind === 'cache' && toolOptions?.workspace === session.defaultWorkspace.path
+          ? '未选择项目目录，当前工作目录是本会话专属任务缓存。新生成的文件默认写入这里，文件工具使用相对路径。不要在用户主目录查找或假定存在项目；需要已有项目资源时请用户选择实际目录。历史记录中的其他目录不代表其文件存在于当前缓存。'
+          : undefined].filter(Boolean).join('\n'),
         abilityPolicies,
         onProgress: progress,
         onOutcome: outcome => { answer.outcome = outcome; emit({type:'outcome',requestId,outcome}); },
@@ -2129,7 +2503,7 @@ export class LocalAiStudioService extends LocalAiService {
         session.messages.push(answer);
       if (session.context?.state !== "error")
         session.context = {
-          ...this.chatContextStatus(session, this.inferenceSettings(session.model)),
+          ...this.chatContextStatus(session, settings),
           message: session.context?.message,
         };
       try {
@@ -2431,6 +2805,8 @@ export class LocalAiStudioService extends LocalAiService {
     switch (action as keyof StudioCommands) {
       case "workflowDefinitions":
         return this.workflow.definitions();
+      case 'nodeMonitorState': return this.nodeMonitorState(event.sender);
+      case 'nodeMonitorCommand': return this.nodeMonitorCommand(value as NodeMonitorCommand,event.sender);
       case 'abilityCatalog': return this.abilityCatalog.list();
       case 'previewPluginState': return (await this.ensureAgentCore()).previewState();
       case 'experienceSearchHealth': return (await this.ensureAgentCore()).searchHealthState();
@@ -2910,6 +3286,7 @@ export class LocalAiStudioService extends LocalAiService {
 
       case "agentCoreRun": {
         const core = await this.ensureAgentCore()
+        this.assertPluginsAvailable();
         const grant = this.agentWorkspaces.get(required(value.workspaceToken, '工作目录授权'))
         if (!grant || grant.owner !== event.sender.id) throw new Error('请先选择 Agent 工作目录')
         const workspace = new AgentWorkspace(grant.path)
@@ -3056,9 +3433,11 @@ export class LocalAiStudioService extends LocalAiService {
         if (!this.skillPlatform) {
           await this.initializeSkills()
         }
-        if (this.agentCoreService!.getStatus().runningTasks) throw new Error('请先停止运行中的 Agent 任务再重新加载插件')
-        await this.skillPlatform!.initialize()
-        await this.agentCoreService!.getCapabilityRegistry().reload()
+        this.beginPluginMutation();
+        try{
+          await this.skillPlatform!.initialize()
+          await this.agentCoreService!.getCapabilityRegistry().reload()
+        }finally{this.mutatingPlugin=false}
         return
 
       case "skillGetContent": {
@@ -3086,9 +3465,7 @@ export class LocalAiStudioService extends LocalAiService {
 
       case "skillDelete": {
         const core=await this.ensureAgentCore()
-        if(this.chats.size||core.getStatus().runningTasks)throw new Error('请先停止运行中的对话或 Agent 任务再删除插件')
-        if(this.deletingPlugin)throw new Error('正在删除插件，请稍后再试')
-        this.deletingPlugin=true
+        this.beginPluginMutation()
         try{
         const id=required(value.skillName,'插件标识'),skill=this.skillPlatform!.get(id)
         if(!skill)throw new Error('插件不存在或已删除')
@@ -3101,7 +3478,7 @@ export class LocalAiStudioService extends LocalAiService {
         })
         await core.getCapabilityRegistry().reload()
         return
-        }finally{this.deletingPlugin=false}
+        }finally{this.mutatingPlugin=false}
       }
 
       case "skillCompile": {
@@ -3117,7 +3494,7 @@ export class LocalAiStudioService extends LocalAiService {
         if (!this.skillPlatform) {
           await this.initializeSkills()
         }
-        if (this.agentCoreService!.getStatus().runningTasks) throw new Error('请先停止运行中的 Agent 任务再编辑插件')
+        this.assertPluginReloadIdle();
         const skillName = required(value.skillName, "插件名称")
         const skillJson = record(value.skillJson)
         const indexPy = textValue(value.indexPy, 200000)
@@ -3133,7 +3510,8 @@ export class LocalAiStudioService extends LocalAiService {
           await this.compileSkillCode(enginePy)
         }
         if (skillJson.id !== skillName) throw new Error('插件 ID 不可在编辑时修改')
-
+        this.beginPluginMutation();
+        try{
         await Promise.all([
           fs.writeFile(
             path.join(skillDir, 'skill.json'),
@@ -3156,6 +3534,7 @@ export class LocalAiStudioService extends LocalAiService {
         await this.skillPlatform!.initialize()
         await this.agentCoreService!.getCapabilityRegistry().reload()
         return
+        }finally{this.mutatingPlugin=false}
       }
 
       case "skillTestTool": {
@@ -3194,7 +3573,8 @@ export class LocalAiStudioService extends LocalAiService {
         if (existsSync(skillDir)) {
           throw new Error('插件已存在')
         }
-
+        this.beginPluginMutation();
+        try{
         await fs.mkdir(skillDir, { recursive: true })
 
         const toolName = `${skillName.replace(/-/g, '_')}_tool`
@@ -3286,6 +3666,7 @@ if __name__ == '__main__' and '--runtime-mode' in sys.argv:
         await this.skillPlatform!.initialize()
         await this.agentCoreService!.getCapabilityRegistry().reload()
         return
+        }finally{this.mutatingPlugin=false}
       }
 
       case "getDefaultWorkspace": {
@@ -3293,7 +3674,7 @@ if __name__ == '__main__' and '--runtime-mode' in sys.argv:
         if (projects.length > 0) {
           return projects[0].workspace
         }
-        return os.homedir()
+        return this.ensureCacheWorkspace()
       }
 
       case "agentSteer": {
@@ -3454,7 +3835,7 @@ if __name__ == '__main__' and '--runtime-mode' in sys.argv:
           apiFormat: result.settings.apiFormat,
           endpoint: result.settings.endpoint,
           model: result.settings.model,
-          ...(profile ? { contextLength: profile.contextLength } : {}),
+          ...(profile && this.studioSettings().source === 'external' ? { contextLength: profile.contextLength } : {}),
         });
         return { settings: this.studioSettings(), profiles: result.profiles };
       }
@@ -3466,7 +3847,7 @@ if __name__ == '__main__' and '--runtime-mode' in sys.argv:
           apiFormat: result.settings.apiFormat,
           endpoint: result.settings.endpoint,
           model: result.settings.model,
-          ...(profile ? { contextLength: profile.contextLength } : {}),
+          ...(profile && this.studioSettings().source === 'external' ? { contextLength: profile.contextLength } : {}),
         });
         return { settings: this.studioSettings(), profiles: result.profiles };
       }
@@ -3643,6 +4024,8 @@ if __name__ == '__main__' and '--runtime-mode' in sys.argv:
       }
       case "chat":
         return this.startChat(input, event.sender);
+      case "chatRuns":
+        return this.chatRuns(event.sender.id);
       case "compactSession":
         return this.startChat(input, event.sender, true);
       case "chatApprove": {
@@ -3687,6 +4070,8 @@ if __name__ == '__main__' and '--runtime-mode' in sys.argv:
     return this.automation.tasks().some(task => task.enabled);
   }
   async dispose() {
+    await this.nodeMonitor?.dispose();
+    this.monitorSessionOwners.clear();this.monitorOwner=undefined;
     this.abilityModelEvaluation.cancel();
     this.abilityModules.dispose();
     this.selectionModule.dispose();
@@ -3706,6 +4091,7 @@ if __name__ == '__main__' and '--runtime-mode' in sys.argv:
     this.runtime.dispose();
     this.downloads.dispose();
     await mcpCleanup;
+    this.graphHistory.dispose();
   }
 }
 

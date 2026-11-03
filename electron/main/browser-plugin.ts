@@ -3,6 +3,8 @@ import type {CapabilityRegistry} from './agent/core/capability-registry.js'
 export const browserCapabilityNames = new Set(['browser.open','browser.read_page','browser.click','browser.fill','browser.select_option','browser.inspect','browser.screenshot'])
 let browser:InternalBrowser|undefined
 export function configureBrowserPlugin(instance:InternalBrowser){browser=instance}
+/** Read host configuration without opening a page or changing the user's opt-in. */
+export function browserPluginState(){return {configured:!!browser,enabled:browser?.isAutomationEnabled()===true}}
 export function registerBrowserPlugin(registry:CapabilityRegistry){
  const target={url:{type:'string',description:'read_page 返回的网页 URL，供用户核对操作页面。'},label:{type:'string',description:'目标元素的原始 label，供用户核对操作对象。'},snapshot:{type:'string',description:'read_page 返回的快照标识。每次操作后必须重新读取。'},ref:{type:'integer',minimum:0,maximum:149,description:'快照中的元素编号'}}
  const definitions=[

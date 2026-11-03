@@ -7,6 +7,15 @@ declare global {
  interface Window {
   myplane:{
    desktopPlatform?:string
+   runtimeGraphWindow(action:'open'|'close'|'state',sessionId?:string):Promise<boolean>
+   runtimeGraphSnapshot(sessionId?:string):Promise<import('../electron/shared/runtime-graph').RuntimeGraphSnapshot>
+   runtimeGraphHistory(sessionId:string):Promise<import('../electron/shared/runtime-workbench').RuntimeHistoryIndex>
+   runtimeGraphFrame(sessionId:string,id:string):Promise<import('../electron/shared/runtime-workbench').RuntimeHistoryFrame>
+   runtimeGraphTemplates(command?:import('../electron/shared/runtime-workbench').TemplateCommand):Promise<import('../electron/shared/runtime-workbench').SharedNodeTemplate[]>
+   runtimeGraphWorkflow(sessionId:string):Promise<string>
+   runtimeGraphDetail(sessionId:string,nodeId:string):Promise<import('../electron/shared/runtime-workbench').WorkbenchNodeDetail>
+   runtimeGraphCommand(command:import('../electron/shared/runtime-workbench').WorkbenchCommand):Promise<import('../electron/shared/runtime-workbench').WorkbenchNodeDetail>
+   onRuntimeGraphSelection(callback:(sessionId:string)=>void):()=>void
    inspectorSnapshot():Promise<import('../electron/shared/execution-inspector').InspectorWindowContext>
    inspectorContext(value:import('../electron/shared/execution-inspector').InspectorWindowContext):Promise<void>
    inspectorWindow(action:'open'|'close'|'state'):Promise<boolean>

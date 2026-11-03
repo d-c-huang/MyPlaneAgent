@@ -65,14 +65,14 @@ export class WeatherWorkflow {
   if(!options.webEnabled){options.onOutcome?.('blocked');options.onContent('查询最新天气需要开启本会话的联网开关。');return true}
   const cap:Capability={name:'weather.forecast',description:'向 Open-Meteo 发送城市名称与坐标，查询并校验目标日期的天气预报',category:'weather',source:{type:'builtin'},runtime:'builtin',permissions:['network'],tags:['requires-approval'],parameters:{type:'object',properties:{city:{type:'string',enum:Object.keys(cities)},day:{type:'string',minLength:1,maxLength:10}},required:['city','day'],additionalProperties:false}}
   const activity:StudioToolActivity={id:randomUUID(),capability:cap.name,args:request,status:'waiting'}
-  if(options.inspectTool){request=await options.inspectTool(cap,request,activity.id) as WeatherRequest;options.signal.throwIfAborted();activity.args=request}
+  if(options.inspectTool){request=await options.inspectTool(cap,request,activity.id,options.executionContext,options.signal) as WeatherRequest;options.signal.throwIfAborted();activity.args=request}
   validateToolArguments(cap.parameters,request)
   if((options.getApprovalMode?.()??options.approvalMode)==='ask'&&options.approvalGranted?.(activity)!==true){options.onActivity({...activity});const approved=await options.approve({...activity});options.signal.throwIfAborted();if(!approved){activity.status='denied';activity.output='天气查询被拒绝，已停止。';options.onActivity({...activity});options.onOutcome?.('blocked');options.onContent(activity.output);return true}}
   const block=options.beforeExecution?.(cap,request)
   if(block){options.onOutcome?.('blocked');options.onContent(block);return true}
   activity.status='running';options.onActivity({...activity});options.onProgress?.('正在执行天气流程：定位城市、解析日期并校验最新预报','working')
   let result:Forecast
-  try{result=await this.forecast(request,options.signal,options.webAllowSyntheticIp===true)}catch(error){
+  try{options.workbench?.assertAllowed(options.executionContext?.itemId||'main',cap.name);result=await this.forecast(request,options.signal,options.webAllowSyntheticIp===true)}catch(error){
    options.signal.throwIfAborted();options.afterExecution?.(cap,request,false)
    activity.status='error';activity.output=String(error);options.onActivity({...activity})
    try{store.record(query,options.workspace,['weather.forecast'],false,undefined,experienceFailure(error))}catch{options.onProgress?.('知识库写入失败，本次查询记录仍保留在会话中','working')}
